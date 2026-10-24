@@ -197,6 +197,12 @@ async def read_stream(ws, reconnect_attempts):
     martingale_step = 0
     max_stake = 100.0
 
+    max_pl = 0
+    min_pl = 0
+
+    target_reached_count = 0
+    basket_amt = 0
+
     async for message in ws:
         data = json.loads(message)
 
@@ -289,6 +295,12 @@ async def read_stream(ws, reconnect_attempts):
                 profit = float(poc.get("profit", 0.0))
                 net_pl += profit
 
+                if net_pl > max_pl:
+                    max_pl = net_pl
+
+                if net_pl < min_pl:
+                    min_pl = net_pl
+
                 if status == "won":
                     wins += 1
                     current_win_streak += 1
@@ -347,15 +359,27 @@ async def read_stream(ws, reconnect_attempts):
                     f"{(wins / (wins + losses) * 100 if wins + losses else 0):.0f}"
                 )
 
+                target_status = (
+                    "⛔"
+                    if net_pl < 15
+                    else f"✅ [{target_reached_count}] [BSKT {basket_amt} USD]"
+                )
+
                 print("\n==========================================")
-                print(f"   TRADE RESOLVED | ID: {c_id}")
-                print(f"   Result: {str(status).upper()}")
-                print(f"   Current P&L: {profit:+.2f} USD")
-                print(f"   Win rate: " f"{win_rate}%")
+                print(f"   TRADE RESOLVED | ID: {c_id}    [URSVD {unresolved}]")
+                print(f"   Result: {str(status).upper()}  [MXLS {longest_loss_streak}]")
+                print(f"   Current P&L: {profit:+.2f} USD [MXPL {max_pl}]")
+                print(f"   Win rate: " f"{win_rate}%      [MINPL {min_pl}]")
                 print("==========================================")
                 print(f"   Min bankroll: {min_bankroll} USD")
-                print(f"   Net P&L: {net_pl:+.2f} USD")
+                print(f"   Net P&L: {net_pl:+.2f} USD     [TGTPL {target_status}]")
                 print("==========================================\n")
+
+                if net_pl >= 15:
+                    basket_amt += net_pl
+                    target_reached_count += 1
+                    net_pl = 0
+                    print("Net PL has been reset.")
 
 
 async def stream():
