@@ -364,14 +364,16 @@ async def read_stream(ws, reconnect_attempts):
                     if net_pl < 15
                     else f"✅ [{target_reached_count}] [BSKT {basket_amt} USD]"
                 )
+                emoji = "‼️‼️" if status == "lost" else "🏆🏆"
+                emoji += f" [C{"L" if current_loss_streak else "W"}S {current_loss_streak or current_win_streak}]"
 
-                print("\n==========================================")
+                print(f"\n=========================================={emoji}")
                 print(f"   TRADE RESOLVED | ID: {c_id}    [URSVD {unresolved}]")
                 print(f"   Result: {str(status).upper()}  [MXLS {longest_loss_streak}]")
                 print(f"   Current P&L: {profit:+.2f} USD [MXPL {max_pl}]")
                 print(f"   Win rate: " f"{win_rate}%      [MINPL {min_pl}]")
                 print("==========================================")
-                print(f"   Min bankroll: {min_bankroll} USD")
+                print(f"   Min bankroll: {min_bankroll} USD ")
                 print(f"   Net P&L: {net_pl:+.2f} USD     [TGTPL {target_status}]")
                 print("==========================================\n")
 
