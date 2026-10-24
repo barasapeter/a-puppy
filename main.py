@@ -187,17 +187,14 @@ async def read_stream(ws, reconnect_attempts):
 
         msg_type = data.get("msg_type")
 
-        # 1. Handle incoming continuous stream data
+        # 1. Handle incoming continuous tick data
         if msg_type == "tick":
             signal = process_tick(data["tick"], reconnect_attempts)
 
-            # If a streak signal returned instructions, execute immediately!
             if signal:
                 buy_payload = {
-                    "buy": "1",  # "1" tells the server we are passing parameters inline
-                    "price": float(
-                        signal["amount"]
-                    ),  # Top-level max purchase price (stake amount)
+                    "buy": "1",
+                    "price": float(signal["amount"]),
                     "parameters": {
                         "amount": float(signal["amount"]),
                         "basis": "stake",
@@ -205,9 +202,7 @@ async def read_stream(ws, reconnect_attempts):
                         "currency": "USD",
                         "duration": 1,
                         "duration_unit": "t",
-                        "underlying_symbol": signal[
-                            "symbol"
-                        ],  # FIXED: Must be 'underlying_symbol', not 'symbol'
+                        "underlying_symbol": signal["symbol"],
                     },
                     "req_id": 5005,
                 }
@@ -216,13 +211,38 @@ async def read_stream(ws, reconnect_attempts):
                 )
                 await ws.send(json.dumps(buy_payload))
 
-        # 2. Handle specific async contract purchase callbacks
+        # 2. Handle buy confirmations & immediately subscribe to its outcome
         elif msg_type == "buy" and data.get("req_id") == 5005:
             buy_info = data.get("buy", {})
+            contract_id = buy_info.get("contract_id")
             print(
-                f"\n[+] ORDER CONFIRMED | Contract ID: {buy_info.get('contract_id')} | "
-                f"Balance Remaining: {buy_info.get('balance_after'):.2f} USD\n"
+                f"\n[+] ORDER CONFIRMED | Contract ID: {contract_id} | Balance: {buy_info.get('balance_after'):.2f} USD"
             )
+
+            # Send subscription request for this specific contract's status lifecycle
+            poc_payload = {
+                "proposal_open_contract": 1,
+                "contract_id": int(contract_id),
+                "subscribe": 1,
+                "req_id": 7007,
+            }
+            await ws.send(json.dumps(poc_payload))
+
+        # 3. Handle live status monitoring and final resolution outcomes
+        elif msg_type == "proposal_open_contract":
+            poc = data.get("proposal_open_contract", {})
+
+            # Check if the contract lifecycle has officially closed out
+            if poc.get("is_sold"):
+                status = poc.get("status")  # Returns "won" or "lost"
+                profit = float(poc.get("profit", 0.0))
+                c_id = poc.get("contract_id")
+
+                print(f"\n==========================================")
+                print(f"   TRADE RESOLVED | ID: {c_id}")
+                print(f"   Result: {status.upper()}")
+                print(f"   Net P&L: {profit:+.2f} USD")
+                print(f"==========================================\n")
 
 
 async def stream():
