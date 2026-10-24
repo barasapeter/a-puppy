@@ -344,19 +344,14 @@ async def read_stream(ws, reconnect_attempts):
                     / (martingale_multiplier - 1)
                 )
                 win_rate = (
-                    f"{(wins / (wins + losses) * 100 if wins + losses else 0):.2f}"
+                    f"{(wins / (wins + losses) * 100 if wins + losses else 0):.0f}"
                 )
 
                 print("\n==========================================")
                 print(f"   TRADE RESOLVED | ID: {c_id}")
                 print(f"   Result: {str(status).upper()}")
                 print(f"   Current P&L: {profit:+.2f} USD")
-                print(f"   Unresolved: {unresolved}")
                 print(f"   Win rate: " f"{win_rate}%")
-                print(f"   Longest win streak: {longest_win_streak}")
-                print(f"   Longest loss streak: {longest_loss_streak}")
-                print(f"   Next stake: {current_stake:.2f} USD")
-                print(f"   Martingale step: {martingale_step}")
                 print("==========================================")
                 print(f"   Min bankroll: {min_bankroll} USD")
                 print(f"   Net P&L: {net_pl:+.2f} USD")
