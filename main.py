@@ -12,7 +12,6 @@ SYMBOLS = ["1HZ100V"]
 
 STREAK = 3
 BIAS_WINDOW = 1
-TRADE_STAKE = 1.0  # $1 stake configuration
 
 previous_prices = {}
 streaks = {}
@@ -122,7 +121,7 @@ def process_tick(tick, **kwargs):
         state["count"] = 0
         state["alerted"] = False
 
-        print(f"{time_text} | {symbol} | {price} | FLAT []")
+        # print(f"{time_text} | {symbol} | {price} | FLAT []")
         return None
 
     state = streaks.setdefault(
@@ -152,7 +151,7 @@ def process_tick(tick, **kwargs):
         )
 
         state["alerted"] = True
-        message += f" | Monitoring next {BIAS_WINDOW} ticks -> TRIGGERING PUT"
+        message += f" | Monitoring next {BIAS_WINDOW} ticks"
 
         # Package trade payload information to hand over to async handler
         trade_signal = {
@@ -160,7 +159,6 @@ def process_tick(tick, **kwargs):
             "contract_type": infer_market_bias(
                 stats=get_stats(symbol), current_streak_direction=direction
             ),
-            "amount": TRADE_STAKE,
             "current_quote": price,
         }
 
@@ -203,6 +201,8 @@ async def read_stream(ws, reconnect_attempts):
     target_reached_count = 0
     basket_amt = 0
 
+    active_contract_is_on = False
+
     async for message in ws:
         data = json.loads(message)
 
@@ -242,14 +242,17 @@ async def read_stream(ws, reconnect_attempts):
                     print("--> [SKIP] Order skipped")
 
                 else:
-                    print(
-                        f"--> [SENDING ORDER] Placing "
-                        f"{signal['contract_type']} order on "
-                        f"{signal['symbol']} | Stake: {stake:.2f} USD | "
-                        f"Martingale step: {martingale_step}"
-                    )
+                    if not active_contract_is_on:
+                        print(
+                            f"--> [SENDING ORDER] Placing "
+                            f"{signal['contract_type']} order on "
+                            f"{signal['symbol']} | Stake: {stake:.2f} USD | "
+                            f"Martingale step: {martingale_step}"
+                        )
 
-                    await ws.send(json.dumps(buy_payload))
+                        await ws.send(json.dumps(buy_payload))
+                    else:
+                        print("--> [SKIP] Order. Active one contract open.")
 
         elif msg_type == "buy" and data.get("req_id") == 5005:
             buy_info = data.get("buy", {})
@@ -279,9 +282,13 @@ async def read_stream(ws, reconnect_attempts):
             }
 
             await ws.send(json.dumps(poc_payload))
+            active_contract_is_on = True
 
         elif msg_type == "proposal_open_contract":
             poc = data.get("proposal_open_contract", {})
+
+            # import pprint
+            # pprint.pprint(poc)
 
             if poc.get("is_sold"):
                 c_id = poc.get("contract_id")
@@ -292,6 +299,7 @@ async def read_stream(ws, reconnect_attempts):
                 resolved_contracts.add(c_id)
 
                 status = poc.get("status")
+
                 profit = float(poc.get("profit", 0.0))
                 net_pl += profit
 
@@ -310,10 +318,7 @@ async def read_stream(ws, reconnect_attempts):
                     current_stake = base_stake
                     martingale_step = 0
 
-                    print(
-                        f"[MARTINGALE] Win detected. "
-                        f"Stake reset to {current_stake:.2f} USD."
-                    )
+                    print(f"Stake reset to {current_stake:.2f} USD.")
 
                 elif status == "lost":
                     losses += 1
@@ -328,7 +333,6 @@ async def read_stream(ws, reconnect_attempts):
                             current_stake = next_stake
                             martingale_step += 1
                             print(
-                                f"[MARTINGALE] Loss detected. "
                                 f"Next stake: {current_stake:.2f} USD "
                                 f"(step {martingale_step})."
                             )
@@ -360,12 +364,25 @@ async def read_stream(ws, reconnect_attempts):
                 )
 
                 target_status = (
-                    "⛔"
-                    if net_pl < 15
-                    else f"✅ [{target_reached_count}] [BSKT {basket_amt} USD]"
+                    "⏰"
+                    if net_pl < 15 and target_reached_count == 0
+                    else f"✅ [{target_reached_count}] [BSKT {basket_amt:.2f} USD]"
                 )
-                emoji = "‼️‼️" if status == "lost" else "🏆🏆"
+                emoji = (
+                    "❗" * current_loss_streak
+                    if status == "lost"
+                    else "🏆" * current_win_streak
+                )
                 emoji += f" [C{"L" if current_loss_streak else "W"}S {current_loss_streak or current_win_streak}]"
+
+                spot_data = {
+                    "entry_spot": poc.get("entry_spot"),
+                    "exit_spot": poc.get("exit_spot"),
+                    "buy_price": poc.get("buy_price"),
+                }
+                import pprint
+
+                pprint.pprint(spot_data)
 
                 print(f"\n=========================================={emoji}")
                 print(f"   TRADE RESOLVED | ID: {c_id}    [URSVD {unresolved}]")
@@ -383,6 +400,8 @@ async def read_stream(ws, reconnect_attempts):
                     net_pl = 0
                     print("Net PL has been reset.")
 
+                active_contract_is_on = False
+
 
 async def stream():
     ACCOUNT_TYPE = "demo"
@@ -390,16 +409,14 @@ async def stream():
 
     while True:
         try:
-            print("Fetching clean WebSocket URL...")
+            print("Fetching WebSocket URL...")
             URL = get_ws_url(account_type=ACCOUNT_TYPE)
 
             async with websockets.connect(
                 URL, open_timeout=15, ping_interval=30, ping_timeout=10
             ) as ws:
                 print("Connected to Deriv")
-                print(
-                    f"STREAK={STREAK} | BIAS_WINDOW={BIAS_WINDOW} | STAKE=${TRADE_STAKE}"
-                )
+                print(f"STREAK={STREAK} | BIAS_WINDOW={BIAS_WINDOW} ")
 
                 previous_prices.clear()
                 streaks.clear()
