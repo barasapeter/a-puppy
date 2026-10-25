@@ -1,3 +1,5 @@
+# signal_core.py
+
 import random
 
 
@@ -12,5 +14,4 @@ def infer_market_bias(stats: dict, current_streak_direction: str) -> str:
     behavior = "REVERSAL" if reversal > continuation else "CONTINUATION"
 
     follow_up = is_up if behavior == "CONTINUATION" else not is_up
-    # return "CALL" if follow_up else "PUT"
-    return random.choice(["CALL", "PUT"])
+    return "CALL" if follow_up else "PUT"

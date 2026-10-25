@@ -1,448 +1,609 @@
+"""
+Deriv tick-streak bot (optimised rewrite).
+
+Key ideas
+---------
+* LOOKAHEAD ("virtual streak"): a buy never executes on the signal tick, it
+  executes on the tick that arrives after the server has processed it (usually
+  1-2 ticks later).  So we fire the order *early*, assuming the next
+  LOOKAHEAD ticks continue the streak:
+
+      virtual streak = real streak + LOOKAHEAD
+      fire when virtual streak >= STREAK
+
+  With STREAK=3 and LOOKAHEAD=1 the order is sent on the 2nd real tick, so the
+  contract enters on the tick that would have been the 3rd (whether or not it
+  really continued) and its exit is the tick after.  Bias statistics use the
+  exact same entry/exit pair, so stats and trades measure the same thing.
+
+* AUTO_LOOKAHEAD: every resolved contract reports `entry_tick_time`.  We turn
+  that into "ticks between signal and entry" and keep a rolling median, so the
+  look-ahead tunes itself to your real latency.
+
+* The busy flag is set BEFORE the order is sent (no double orders while a buy
+  confirmation is in flight) and is always released on errors / reconnects.
+"""
+
 import asyncio
 import json
+import time
 import traceback
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from statistics import median_low
 
 import websockets
 
 from auth import get_ws_url
 from signal_core import infer_market_bias
 
+try:  # optional speed-up: pip install orjson
+    import orjson
+
+    loads = orjson.loads
+
+    def dumps(obj):
+        return orjson.dumps(obj).decode()  # Deriv expects text frames
+
+except ImportError:
+    loads = json.loads
+    dumps = json.dumps
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+ACCOUNT_TYPE = "demo"
 SYMBOLS = ["1HZ100V"]
+CURRENCY = "USD"
 
-STREAK = 3
-BIAS_WINDOW = 1
+STREAK = 4  # target streak length (virtual, includes look-ahead ticks)
+BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
-previous_prices = {}
-streaks = {}
-active_windows = {}
-session_stats = {}
+LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
+AUTO_LOOKAHEAD = True  # tune LOOKAHEAD from measured entry lag
+MAX_LOOKAHEAD = 3
+
+USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
+PRINT_TICKS = True
+
+BASE_STAKE = 1.0
+MARTINGALE_MULTIPLIER = 2.0
+MAX_MARTINGALE_STEPS = 10
+MAX_STAKE = 100.0
+TARGET_PL = 15.0
+
+REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
+REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
 
 def timestamp(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%H:%M:%S")
 
 
-def get_stats(symbol):
-    return session_stats.setdefault(
-        symbol, {"continuation": 0, "reversal": 0, "neutral": 0}
+# --------------------------------------------------------------------------- #
+# State containers
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class Window:
+    direction: str
+    start_price: float | None  # None until the window opens
+    wait: int  # ticks left before the window opens
+    ticks_seen: int = 0
+
+
+@dataclass(slots=True)
+class SymbolState:
+    prev: float | None = None
+    direction: str | None = None
+    count: int = 0
+    alerted: bool = False
+    tick_idx: int = 0
+    recent: deque = field(default_factory=lambda: deque(maxlen=30))  # (epoch, idx)
+    windows: list = field(default_factory=list)
+    stats: dict = field(
+        default_factory=lambda: {"continuation": 0, "reversal": 0, "neutral": 0}
     )
 
-
-def print_stats(symbol):
-    stats = get_stats(symbol)
-    total = sum(stats.values())
-
-    if total == 0:
-        return
-
-    continuation_pct = stats["continuation"] / total * 100
-    reversal_pct = stats["reversal"] / total * 100
-    neutral_pct = stats["neutral"] / total * 100
-
-    print(
-        f"SESSION BIAS | {symbol} | "
-        f"Continuation: {continuation_pct:.1f}% "
-        f"({stats['continuation']}) | "
-        f"Reversal: {reversal_pct:.1f}% "
-        f"({stats['reversal']}) | "
-        f"Neutral: {neutral_pct:.1f}% "
-        f"({stats['neutral']}) | "
-        f"Completed: {total}"
-    )
+    def reset_stream(self):
+        """Clear tick state after a reconnect (stats are kept for the session)."""
+        self.prev = None
+        self.direction = None
+        self.count = 0
+        self.alerted = False
+        self.recent.clear()
+        self.windows.clear()
 
 
-def update_windows(symbol, price, epoch):
-    windows = active_windows.setdefault(symbol, [])
-    remaining = []
+@dataclass(slots=True)
+class Order:
+    symbol: str
+    contract_type: str
+    signal_idx: int
+    t_sent: float
+    contract_id: int | None = None
 
-    for window in windows:
-        window["ticks_seen"] += 1
 
-        if window["ticks_seen"] < BIAS_WINDOW:
-            remaining.append(window)
-            continue
+# --------------------------------------------------------------------------- #
+# Bot
+# --------------------------------------------------------------------------- #
+class Bot:
+    def __init__(self):
+        self.ws = None
+        self.reconnects = 0
+        self.symbols = {s: SymbolState() for s in SYMBOLS}
 
-        start_price = window["start_price"]
-        direction = window["direction"]
+        # look-ahead calibration
+        self.lookahead = LOOKAHEAD
+        self.lag_samples = deque(maxlen=5)
 
-        if price > start_price:
-            outcome = "CONTINUATION" if direction == "UP" else "REVERSAL"
-        elif price < start_price:
-            outcome = "CONTINUATION" if direction == "DOWN" else "REVERSAL"
-        else:
-            outcome = "NEUTRAL"
+        # order tracking
+        self.busy = False  # True from "send" until resolved / failed
+        self.order = None
+        self.resolved = set()
+        self.proposals = {}  # (symbol, contract_type) -> (proposal_id, stake)
 
-        stats = get_stats(symbol)
-        stats[outcome.lower()] += 1
+        # money management
+        self.stake = BASE_STAKE
+        self.mg_step = 0
 
-        change = price - start_price
+        # statistics
+        self.wins = self.losses = self.unresolved = 0
+        self.net_pl = self.max_pl = self.min_pl = 0.0
+        self.win_streak = self.loss_streak = 0
+        self.longest_win = self.longest_loss = 0
+        self.target_hits = 0
+        self.basket = 0.0
 
-        print(
-            f"\nBIAS RESULT | {timestamp(epoch)} | {symbol} | "
-            f"Original: {direction} | "
-            f"Start: {start_price} | End: {price} | "
-            f"Change: {change:+.5f} | "
-            f"Outcome: {outcome} | "
-            f"Window: {BIAS_WINDOW} ticks"
+    # ----------------------------------------------------------------- utils
+    def trigger_count(self):
+        return max(1, STREAK - self.lookahead)
+
+    def release(self):
+        self.busy = False
+        self.order = None
+
+    async def send(self, payload):
+        await self.ws.send(dumps(payload))
+
+    @staticmethod
+    def stats_line(symbol, stats):
+        total = sum(stats.values())
+        if not total:
+            return None
+        c, r, n = stats["continuation"], stats["reversal"], stats["neutral"]
+        return (
+            f"SESSION BIAS | {symbol} | "
+            f"Continuation: {c / total * 100:.1f}% ({c}) | "
+            f"Reversal: {r / total * 100:.1f}% ({r}) | "
+            f"Neutral: {n / total * 100:.1f}% ({n}) | Completed: {total}"
         )
 
-        print_stats(symbol)
+    # ------------------------------------------------------------ tick logic
+    def update_windows(self, st, symbol, price, epoch, logs):
+        """Resolve bias windows. Pure computation; log lines are buffered."""
+        if not st.windows:
+            return
 
-    active_windows[symbol] = remaining
-
-
-def process_tick(tick, **kwargs):
-    """Processes tick telemetry. Returns a signal dict if a trade is triggered."""
-    symbol = tick["symbol"]
-    price = float(tick["quote"])
-    epoch = tick["epoch"]
-
-    previous = previous_prices.get(symbol)
-    previous_prices[symbol] = price
-
-    time_text = timestamp(epoch)
-
-    if previous is None:
-        print(f"{time_text} | {symbol} | {price} | Waiting")
-        return None
-
-    update_windows(symbol, price, epoch)
-
-    if price > previous:
-        direction = "UP"
-    elif price < previous:
-        direction = "DOWN"
-    else:
-        state = streaks.setdefault(
-            symbol, {"direction": None, "count": 0, "alerted": False}
-        )
-        state["direction"] = None
-        state["count"] = 0
-        state["alerted"] = False
-
-        # print(f"{time_text} | {symbol} | {price} | FLAT []")
-        return None
-
-    state = streaks.setdefault(
-        symbol, {"direction": None, "count": 0, "alerted": False}
-    )
-
-    if state["direction"] == direction:
-        state["count"] += 1
-    else:
-        state["direction"] = direction
-        state["count"] = 1
-        state["alerted"] = False
-
-    bar = "[" + str(state["count"]) + "]"
-    message = (
-        f"{time_text} [{kwargs.get("reconnect_attempts")}] | {symbol} | {price:.2f} | "
-        f"{direction:<4} {bar}"
-    )
-
-    trade_signal = None
-
-    if state["count"] >= STREAK and not state["alerted"]:
-        message += f" | STREAK {STREAK} REACHED"
-
-        active_windows.setdefault(symbol, []).append(
-            {"direction": direction, "start_price": price, "ticks_seen": 0}
-        )
-
-        state["alerted"] = True
-        message += f" | Monitoring next {BIAS_WINDOW} ticks"
-
-        # Package trade payload information to hand over to async handler
-        trade_signal = {
-            "symbol": symbol,
-            "contract_type": infer_market_bias(
-                stats=get_stats(symbol), current_streak_direction=direction
-            ),
-            "current_quote": price,
-        }
-
-    print(message)
-    return trade_signal
-
-
-async def send_ping(ws):
-    """Sends app-level heartbeats every 20s to satisfy the Deriv balancer."""
-    try:
-        while True:
-            await asyncio.sleep(20)
-            await ws.send(json.dumps({"ping": 1}))
-    except (asyncio.CancelledError, websockets.ConnectionClosed):
-        pass
-
-
-async def read_stream(ws, reconnect_attempts):
-    """Handles receiving messages and order routing over the active channel."""
-    wins = 0
-    losses = 0
-    unresolved = 0
-    net_pl = 0.0
-    current_win_streak = 0
-    current_loss_streak = 0
-    longest_win_streak = 0
-    longest_loss_streak = 0
-    resolved_contracts = set()
-
-    base_stake = 1.0
-    current_stake = base_stake
-    martingale_multiplier = 2.0
-    max_martingale_steps = 10
-    martingale_step = 0
-    max_stake = 100.0
-
-    max_pl = 0
-    min_pl = 0
-
-    target_reached_count = 0
-    basket_amt = 0
-
-    active_contract_is_on = False
-
-    async for message in ws:
-        data = json.loads(message)
-
-        if "error" in data:
-            print(
-                f"\n[!] API error response: {data['error'].get('message', data['error'])}"
-            )
-            continue
-
-        msg_type = data.get("msg_type")
-
-        if msg_type == "tick":
-            signal = process_tick(
-                data["tick"],
-                reconnect_attempts=reconnect_attempts,
-            )
-
-            if signal:
-                stake = current_stake
-
-                buy_payload = {
-                    "buy": "1",
-                    "price": float(stake),
-                    "parameters": {
-                        "amount": float(stake),
-                        "basis": "stake",
-                        "contract_type": signal["contract_type"],
-                        "currency": "USD",
-                        "duration": 1,
-                        "duration_unit": "t",
-                        "underlying_symbol": signal["symbol"],
-                    },
-                    "req_id": 5005,
-                }
-
-                if signal["contract_type"] == "SKIP":
-                    print("--> [SKIP] Order skipped")
-
-                else:
-                    if not active_contract_is_on:
-                        print(
-                            f"--> [SENDING ORDER] Placing "
-                            f"{signal['contract_type']} order on "
-                            f"{signal['symbol']} | Stake: {stake:.2f} USD | "
-                            f"Martingale step: {martingale_step}"
-                        )
-
-                        await ws.send(json.dumps(buy_payload))
-                    else:
-                        print("--> [SKIP] Order. Active one contract open.")
-
-        elif msg_type == "buy" and data.get("req_id") == 5005:
-            buy_info = data.get("buy", {})
-            contract_id = buy_info.get("contract_id")
-            balance_after = buy_info.get("balance_after")
-
-            if contract_id is None:
-                print("[!] Buy response did not contain a contract ID.")
+        keep = []
+        for w in st.windows:
+            if w.start_price is None:  # still waiting for the entry tick
+                w.wait -= 1
+                if w.wait <= 0:
+                    w.start_price = price
+                keep.append(w)
                 continue
 
-            balance_text = (
-                f"{float(balance_after):.2f} USD"
-                if balance_after is not None
-                else "Unavailable"
+            w.ticks_seen += 1
+            if w.ticks_seen < BIAS_WINDOW:
+                keep.append(w)
+                continue
+
+            start = w.start_price
+            if price == start:
+                outcome = "neutral"
+            elif (price > start) == (w.direction == "UP"):
+                outcome = "continuation"
+            else:
+                outcome = "reversal"
+            st.stats[outcome] += 1
+
+            logs.append(
+                f"\nBIAS RESULT | {timestamp(epoch)} | {symbol} | "
+                f"Original: {w.direction} | Start: {start} | End: {price} | "
+                f"Change: {price - start:+.5f} | Outcome: {outcome.upper()} | "
+                f"Window: {BIAS_WINDOW} ticks"
+            )
+            logs.append(self.stats_line(symbol, st.stats))
+
+        st.windows = keep
+
+    async def on_tick(self, tick):
+        symbol = tick["symbol"]
+        st = self.symbols.get(symbol)
+        if st is None:
+            return
+
+        price = float(tick["quote"])
+        epoch = tick["epoch"]
+
+        st.tick_idx += 1
+        st.recent.append((epoch, st.tick_idx))
+        prev, st.prev = st.prev, price
+
+        if prev is None:
+            print(f"{timestamp(epoch)} | {symbol} | {price} | Waiting")
+            return
+
+        logs = []
+        self.update_windows(st, symbol, price, epoch, logs)
+
+        if price > prev:
+            direction = "UP"
+        elif price < prev:
+            direction = "DOWN"
+        else:  # flat tick breaks the streak
+            st.direction, st.count, st.alerted = None, 0, False
+            if logs:
+                print("\n".join(logs))
+            return
+
+        if st.direction == direction:
+            st.count += 1
+        else:
+            st.direction, st.count, st.alerted = direction, 1, False
+
+        note = ""
+        if st.count >= self.trigger_count() and not st.alerted:
+            st.alerted = True
+            look = self.lookahead
+
+            # Bias window mirrors the real trade: opens on the entry tick
+            # (look ticks from now) and closes BIAS_WINDOW ticks later.
+            st.windows.append(Window(direction, price if look == 0 else None, look))
+
+            contract_type = infer_market_bias(
+                stats=st.stats, current_streak_direction=direction
             )
 
-            print(
-                f"\n[+] ORDER CONFIRMED | Contract ID: {contract_id} | "
-                f"Balance: {balance_text}"
+            # ---- hot path: send BEFORE any printing ----
+            if contract_type == "SKIP":
+                note = " | [SKIP] no bias data yet"
+            elif self.busy:
+                note = " | [SKIP] contract still open"
+            else:
+                mode = await self.place_order(symbol, contract_type, st.tick_idx)
+                note = (
+                    f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
+                    f"step {self.mg_step} | {mode}"
+                )
+
+            note = (
+                f" | STREAK {STREAK} REACHED (real {st.count} + "
+                f"assumed {look}){note} | Monitoring next {BIAS_WINDOW} ticks"
             )
 
-            poc_payload = {
+        if PRINT_TICKS or note:
+            logs.append(
+                f"{timestamp(epoch)} [{self.reconnects}] | {symbol} | {price:.2f} | "
+                f"{direction:<4} [{st.count}]{note}"
+            )
+        if logs:
+            print("\n".join(logs))
+
+    # --------------------------------------------------------------- orders
+    async def place_order(self, symbol, contract_type, signal_idx):
+        stake = self.stake
+        prop = self.proposals.get((symbol, contract_type)) if USE_PROPOSALS else None
+
+        if prop and prop[1] == stake:
+            payload = {"buy": prop[0], "price": stake, "req_id": REQ_BUY}
+            mode = "proposal"
+        else:
+            payload = {
+                "buy": "1",
+                "price": stake,
+                "parameters": {
+                    "amount": stake,
+                    "basis": "stake",
+                    "contract_type": contract_type,
+                    "currency": CURRENCY,
+                    "duration": 1,
+                    "duration_unit": "t",
+                    "underlying_symbol": symbol,
+                },
+                "req_id": REQ_BUY,
+            }
+            mode = "direct"
+
+        # Flag first, send second: no window for a duplicate order.
+        self.busy = True
+        self.order = Order(symbol, contract_type, signal_idx, time.monotonic())
+        await self.send(payload)
+        return mode
+
+    async def refresh_proposals(self):
+        """(Re)subscribe CALL/PUT proposals at the current stake."""
+        self.proposals.clear()
+        await self.send({"forget_all": "proposal"})
+        for symbol in SYMBOLS:
+            for ctype, req_id in REQ_PROPOSAL.items():
+                await self.send(
+                    {
+                        "proposal": 1,
+                        "amount": self.stake,
+                        "basis": "stake",
+                        "contract_type": ctype,
+                        "currency": CURRENCY,
+                        "duration": 1,
+                        "duration_unit": "t",
+                        "underlying_symbol": symbol,
+                        "subscribe": 1,
+                        "req_id": req_id,
+                    }
+                )
+
+    def on_proposal(self, data):
+        prop = data.get("proposal") or {}
+        echo = data.get("echo_req") or {}
+        try:
+            stake = float(echo["amount"])
+            key = (echo["underlying_symbol"], echo["contract_type"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if stake == self.stake and prop.get("id"):  # ignore stale stakes
+            self.proposals[key] = (prop["id"], stake)
+
+    async def subscribe_contract(self, contract_id):
+        await self.send(
+            {
                 "proposal_open_contract": 1,
                 "contract_id": int(contract_id),
                 "subscribe": 1,
-                "req_id": 7007,
+                "req_id": REQ_POC,
             }
+        )
 
-            await ws.send(json.dumps(poc_payload))
-            active_contract_is_on = True
+    async def on_buy(self, data):
+        info = data.get("buy") or {}
+        contract_id = info.get("contract_id")
+        order = self.order
 
-        elif msg_type == "proposal_open_contract":
-            poc = data.get("proposal_open_contract", {})
+        if contract_id is None or order is None:
+            print("[!] Buy response did not contain a contract ID.")
+            self.release()
+            return
 
-            # import pprint
-            # pprint.pprint(poc)
+        order.contract_id = int(contract_id)
+        rtt = (time.monotonic() - order.t_sent) * 1000
+        balance = info.get("balance_after")
+        balance_text = f"{float(balance):.2f} USD" if balance is not None else "n/a"
 
-            if poc.get("is_sold"):
-                c_id = poc.get("contract_id")
+        await self.subscribe_contract(contract_id)
+        print(
+            f"\n[+] ORDER CONFIRMED | Contract ID: {contract_id} | "
+            f"Balance: {balance_text} | Buy RTT: {rtt:.0f} ms"
+        )
 
-                if c_id is None or c_id in resolved_contracts:
-                    continue
+    # ------------------------------------------------------------ resolution
+    def record_lag(self, order, entry_time):
+        """Ticks between the signal tick and the contract's entry tick."""
+        st = self.symbols.get(order.symbol)
+        if st is None or entry_time is None:
+            return None
 
-                resolved_contracts.add(c_id)
+        for epoch, idx in st.recent:
+            if epoch == entry_time:
+                lag = idx - order.signal_idx
+                self.lag_samples.append(lag)
+                if AUTO_LOOKAHEAD and len(self.lag_samples) >= 3:
+                    self.lookahead = max(
+                        0, min(MAX_LOOKAHEAD, median_low(self.lag_samples))
+                    )
+                return lag
+        return None
 
-                status = poc.get("status")
+    def apply_result(self, status, profit):
+        """Update P&L and martingale state. Returns an info message."""
+        self.net_pl += profit
+        self.max_pl = max(self.max_pl, self.net_pl)
+        self.min_pl = min(self.min_pl, self.net_pl)
 
-                profit = float(poc.get("profit", 0.0))
-                net_pl += profit
+        if status == "won":
+            self.wins += 1
+            self.win_streak += 1
+            self.loss_streak = 0
+            self.longest_win = max(self.longest_win, self.win_streak)
+            self.stake, self.mg_step = BASE_STAKE, 0
+            return f"Stake reset to {self.stake:.2f} USD."
 
-                if net_pl > max_pl:
-                    max_pl = net_pl
+        if status == "lost":
+            self.losses += 1
+            self.loss_streak += 1
+            self.win_streak = 0
+            self.longest_loss = max(self.longest_loss, self.loss_streak)
 
-                if net_pl < min_pl:
-                    min_pl = net_pl
+            next_stake = self.stake * MARTINGALE_MULTIPLIER
+            if self.mg_step < MAX_MARTINGALE_STEPS and next_stake <= MAX_STAKE:
+                self.stake = next_stake
+                self.mg_step += 1
+                return f"Next stake: {self.stake:.2f} USD (step {self.mg_step})."
 
-                if status == "won":
-                    wins += 1
-                    current_win_streak += 1
-                    current_loss_streak = 0
-                    longest_win_streak = max(longest_win_streak, current_win_streak)
+            self.stake, self.mg_step = BASE_STAKE, 0
+            reason = (
+                "Maximum recovery steps reached"
+                if self.mg_step >= MAX_MARTINGALE_STEPS
+                else "Stake cap would be exceeded"
+            )
+            return f"[MARTINGALE] {reason}. Resetting to {BASE_STAKE:.2f} USD."
 
-                    current_stake = base_stake
-                    martingale_step = 0
+        self.unresolved += 1
+        return ""
 
-                    print(f"Stake reset to {current_stake:.2f} USD.")
+    async def on_poc(self, data):
+        poc = data.get("proposal_open_contract") or {}
+        if not poc.get("is_sold"):
+            return
 
-                elif status == "lost":
-                    losses += 1
-                    current_loss_streak += 1
-                    current_win_streak = 0
-                    longest_loss_streak = max(longest_loss_streak, current_loss_streak)
+        contract_id = poc.get("contract_id")
+        if contract_id is None or contract_id in self.resolved:
+            return
+        self.resolved.add(contract_id)
 
-                    if martingale_step < max_martingale_steps:
-                        next_stake = current_stake * martingale_multiplier
+        sub_id = (data.get("subscription") or {}).get("id")
+        if sub_id:
+            await self.send({"forget": sub_id})
 
-                        if next_stake <= max_stake:
-                            current_stake = next_stake
-                            martingale_step += 1
-                            print(
-                                f"Next stake: {current_stake:.2f} USD "
-                                f"(step {martingale_step})."
-                            )
-                        else:
-                            current_stake = base_stake
-                            martingale_step = 0
-                            print(
-                                "[MARTINGALE] Stake cap would be exceeded. "
-                                f"Resetting to {base_stake:.2f} USD."
-                            )
-                    else:
-                        current_stake = base_stake
-                        martingale_step = 0
-                        print(
-                            "[MARTINGALE] Maximum recovery steps reached. "
-                            f"Resetting to {base_stake:.2f} USD."
-                        )
+        status = poc.get("status")
+        profit = float(poc.get("profit", 0.0))
 
-                else:
-                    unresolved += 1
+        order = self.order
+        lag = None
+        if order is not None and order.contract_id == contract_id:
+            lag = self.record_lag(order, poc.get("entry_tick_time"))
 
-                min_bankroll = (
-                    base_stake
-                    * (martingale_multiplier ** (longest_loss_streak + 1) - 1)
-                    / (martingale_multiplier - 1)
-                )
-                win_rate = (
-                    f"{(wins / (wins + losses) * 100 if wins + losses else 0):.0f}"
-                )
+        old_stake = self.stake
+        info = self.apply_result(status, profit)
+        if info:
+            print(info)
 
-                target_status = (
-                    "⏰"
-                    if net_pl < 15 and target_reached_count == 0
-                    else f"✅ [{target_reached_count}] [BSKT {basket_amt:.2f} USD]"
-                )
-                emoji = (
-                    "❗" * current_loss_streak
-                    if status == "lost"
-                    else "🏆" * current_win_streak
-                )
-                emoji += f" [C{"L" if current_loss_streak else "W"}S {current_loss_streak or current_win_streak}]"
+        # ---- report ----
+        decided = self.wins + self.losses
+        win_rate = self.wins / decided * 100 if decided else 0
+        mult = MARTINGALE_MULTIPLIER
+        min_bankroll = BASE_STAKE * (mult ** (self.longest_loss + 1) - 1) / (mult - 1)
 
-                spot_data = {
-                    "entry_spot": poc.get("entry_spot"),
-                    "exit_spot": poc.get("exit_spot"),
-                    "buy_price": poc.get("buy_price"),
-                }
-                import pprint
+        target_status = (
+            "⏰"
+            if self.net_pl < TARGET_PL and self.target_hits == 0
+            else f"✅ [{self.target_hits}] [BSKT {self.basket:.2f} USD]"
+        )
+        emoji = "❗" * self.loss_streak if status == "lost" else "🏆" * self.win_streak
+        emoji += (
+            f" [C{'L' if self.loss_streak else 'W'}S "
+            f"{self.loss_streak or self.win_streak}]"
+        )
+        lag_text = "n/a" if lag is None else f"+{lag} tick(s)"
 
-                pprint.pprint(spot_data)
+        print(
+            f"\nEntry {poc.get('entry_spot')} -> Exit {poc.get('exit_spot')} | "
+            f"Buy {poc.get('buy_price')} | Entry lag: {lag_text} | "
+            f"Look-ahead now: {self.lookahead}"
+        )
+        print(f"==========================================={emoji}")
+        print(f"   TRADE RESOLVED | ID: {contract_id}    [URSVD {self.unresolved}]")
+        print(f"   Result: {str(status).upper()}  [MXLS {self.longest_loss}]")
+        print(f"   Current P&L: {profit:+.2f} USD [MXPL {self.max_pl}]")
+        print(f"   Win rate: {win_rate:.0f}%      [MINPL {self.min_pl}]")
+        print("==========================================")
+        print(f"   Min bankroll: {min_bankroll} USD ")
+        print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
+        print("==========================================\n")
 
-                print(f"\n=========================================={emoji}")
-                print(f"   TRADE RESOLVED | ID: {c_id}    [URSVD {unresolved}]")
-                print(f"   Result: {str(status).upper()}  [MXLS {longest_loss_streak}]")
-                print(f"   Current P&L: {profit:+.2f} USD [MXPL {max_pl}]")
-                print(f"   Win rate: " f"{win_rate}%      [MINPL {min_pl}]")
-                print("==========================================")
-                print(f"   Min bankroll: {min_bankroll} USD ")
-                print(f"   Net P&L: {net_pl:+.2f} USD     [TGTPL {target_status}]")
-                print("==========================================\n")
+        if self.net_pl >= TARGET_PL:
+            self.basket += self.net_pl
+            self.target_hits += 1
+            self.net_pl = 0.0
+            print("Net PL has been reset.")
 
-                if net_pl >= 15:
-                    basket_amt += net_pl
-                    target_reached_count += 1
-                    net_pl = 0
-                    print("Net PL has been reset.")
+        self.release()
 
-                active_contract_is_on = False
+        if USE_PROPOSALS and self.stake != old_stake:
+            await self.refresh_proposals()
 
+    def on_error(self, data):
+        err = data["error"]
+        print(f"\n[!] API error response: {err.get('message', err)}")
+        # A failed buy must not leave the bot blocked forever.
+        if data.get("req_id") == REQ_BUY and (
+            self.order is None or self.order.contract_id is None
+        ):
+            self.release()
 
-async def stream():
-    ACCOUNT_TYPE = "demo"
-    RECONNECT_ATTEMPTS = 0
-
-    while True:
+    # ------------------------------------------------------------ connection
+    async def heartbeat(self):
+        """App-level ping every 20s for the Deriv balancer."""
         try:
-            print("Fetching WebSocket URL...")
-            URL = get_ws_url(account_type=ACCOUNT_TYPE)
+            while True:
+                await asyncio.sleep(20)
+                await self.send({"ping": 1})
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            pass
 
-            async with websockets.connect(
-                URL, open_timeout=15, ping_interval=30, ping_timeout=10
-            ) as ws:
-                print("Connected to Deriv")
-                print(f"STREAK={STREAK} | BIAS_WINDOW={BIAS_WINDOW} ")
+    async def on_connect(self):
+        for st in self.symbols.values():
+            st.reset_stream()
+        self.proposals.clear()
 
-                previous_prices.clear()
-                streaks.clear()
-                active_windows.clear()
+        order = self.order
+        if order is not None and order.contract_id is not None:
+            # A contract was open when we dropped: re-attach to its result.
+            await self.subscribe_contract(order.contract_id)
+        else:
+            self.release()  # unknown fate of an in-flight buy; unblock trading
 
-                # Start the tick telemetry registration
-                await ws.send(
-                    json.dumps({"ticks": SYMBOLS, "subscribe": 1, "req_id": 1})
-                )
+        await self.send({"ticks": SYMBOLS, "subscribe": 1, "req_id": REQ_TICKS})
+        if USE_PROPOSALS:
+            await self.refresh_proposals()
 
-                # Process telemetry loop and heartbeats in parallel
-                await asyncio.gather(read_stream(ws, RECONNECT_ATTEMPTS), send_ping(ws))
+    async def read_loop(self):
+        async for raw in self.ws:
+            data = loads(raw)
+            msg_type = data.get("msg_type")
 
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            traceback.print_exc()
+            if msg_type == "tick":  # hot path first
+                await self.on_tick(data["tick"])
+            elif "error" in data:
+                self.on_error(data)
+            elif msg_type == "buy":
+                if data.get("req_id") == REQ_BUY:
+                    await self.on_buy(data)
+            elif msg_type == "proposal_open_contract":
+                await self.on_poc(data)
+            elif msg_type == "proposal":
+                self.on_proposal(data)
 
-            print(f"Connection error occurred: {error}")
-            RECONNECT_ATTEMPTS += 1
-            print("Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+    async def run(self):
+        delay = 2
+        while True:
+            try:
+                print("Fetching WebSocket URL...")
+                url = await asyncio.to_thread(get_ws_url, account_type=ACCOUNT_TYPE)
+
+                async with websockets.connect(
+                    url, open_timeout=15, ping_interval=30, ping_timeout=10
+                ) as ws:
+                    self.ws = ws
+                    print("Connected to Deriv")
+                    print(
+                        f"STREAK={STREAK} | BIAS_WINDOW={BIAS_WINDOW} | "
+                        f"LOOKAHEAD={self.lookahead} (auto={AUTO_LOOKAHEAD}) | "
+                        f"PROPOSALS={USE_PROPOSALS}"
+                    )
+                    await self.on_connect()
+                    delay = 2
+
+                    pinger = asyncio.create_task(self.heartbeat())
+                    try:
+                        await self.read_loop()
+                    finally:
+                        pinger.cancel()
+
+                print("Connection closed.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                traceback.print_exc()
+                print(f"Connection error occurred: {error}")
+
+            self.reconnects += 1
+            print(f"Reconnecting in {delay} seconds...")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(stream())
+        asyncio.run(Bot().run())
     except KeyboardInterrupt:
         print("Stopped")
