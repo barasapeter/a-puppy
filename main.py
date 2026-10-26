@@ -56,7 +56,7 @@ ACCOUNT_TYPE = "demo"
 SYMBOLS = ["1HZ100V"]
 CURRENCY = "USD"
 
-STREAK = 4  # target streak length (virtual, includes look-ahead ticks)
+STREAK = 3  # target streak length (virtual, includes look-ahead ticks)
 BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
 LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
