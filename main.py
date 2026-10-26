@@ -64,14 +64,14 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 3  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1.0
-MARTINGALE_MULTIPLIER = 3.0
+MARTINGALE_MULTIPLIER = 2.0
 MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
