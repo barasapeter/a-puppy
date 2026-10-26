@@ -1,5 +1,5 @@
 """
-Deriv tick-streak bot (optimised rewrite).
+Deriv tick-streak bot (optimised rewrite, per-direction bias).
 
 Key ideas
 ---------
@@ -11,10 +11,9 @@ Key ideas
       virtual streak = real streak + LOOKAHEAD
       fire when virtual streak >= STREAK
 
-  With STREAK=3 and LOOKAHEAD=1 the order is sent on the 2nd real tick, so the
-  contract enters on the tick that would have been the 3rd (whether or not it
-  really continued) and its exit is the tick after.  Bias statistics use the
-  exact same entry/exit pair, so stats and trades measure the same thing.
+* PER-DIRECTION BIAS: continuation/reversal statistics are kept separately for
+  UP streaks and DOWN streaks.  The trade decision for an UP streak uses only
+  the UP statistics, and for a DOWN streak only the DOWN statistics.
 
 * AUTO_LOOKAHEAD: every resolved contract reports `entry_tick_time`.  We turn
   that into "ticks between signal and entry" and keep a rolling median, so the
@@ -61,24 +60,35 @@ STREAK = 4  # target streak length (virtual, includes look-ahead ticks)
 BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
 LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
-AUTO_LOOKAHEAD = True  # tune LOOKAHEAD from measured entry lag
+AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
+
+# Per-direction decision guards (0 / 0.0 = same behaviour as before)
+MIN_SAMPLES = 3  # min decided samples in the current direction's bucket
+MIN_EDGE = 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1.0
-MARTINGALE_MULTIPLIER = 2.0
-MAX_MARTINGALE_STEPS = 10
-MAX_STAKE = 100.0
+MARTINGALE_MULTIPLIER = 3.0
+MAX_MARTINGALE_STEPS = 100
+MAX_STAKE = 4500.0
 TARGET_PL = 15.0
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
+DIRECTIONS = ("UP", "DOWN")
+
 
 def timestamp(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%H:%M:%S")
+
+
+def new_stats():
+    """Fresh per-direction statistics container."""
+    return {d: {"continuation": 0, "reversal": 0, "neutral": 0} for d in DIRECTIONS}
 
 
 # --------------------------------------------------------------------------- #
@@ -101,9 +111,7 @@ class SymbolState:
     tick_idx: int = 0
     recent: deque = field(default_factory=lambda: deque(maxlen=30))  # (epoch, idx)
     windows: list = field(default_factory=list)
-    stats: dict = field(
-        default_factory=lambda: {"continuation": 0, "reversal": 0, "neutral": 0}
-    )
+    stats: dict = field(default_factory=new_stats)
 
     def reset_stream(self):
         """Clear tick state after a reconnect (stats are kept for the session)."""
@@ -167,17 +175,24 @@ class Bot:
         await self.ws.send(dumps(payload))
 
     @staticmethod
-    def stats_line(symbol, stats):
-        total = sum(stats.values())
+    def _bucket_text(label, bucket):
+        total = sum(bucket.values())
         if not total:
-            return None
-        c, r, n = stats["continuation"], stats["reversal"], stats["neutral"]
+            return f"{label}: n/a (0)"
+        c, r, n = bucket["continuation"], bucket["reversal"], bucket["neutral"]
         return (
-            f"SESSION BIAS | {symbol} | "
-            f"Continuation: {c / total * 100:.1f}% ({c}) | "
-            f"Reversal: {r / total * 100:.1f}% ({r}) | "
-            f"Neutral: {n / total * 100:.1f}% ({n}) | Completed: {total}"
+            f"{label}: Cont {c / total * 100:.1f}% ({c}) | "
+            f"Rev {r / total * 100:.1f}% ({r}) | "
+            f"Neu {n / total * 100:.1f}% ({n}) | N={total}"
         )
+
+    @classmethod
+    def stats_line(cls, symbol, stats):
+        grand = sum(sum(b.values()) for b in stats.values())
+        if not grand:
+            return None
+        parts = [cls._bucket_text(d, stats[d]) for d in DIRECTIONS]
+        return f"SESSION BIAS | {symbol} | " + "  ||  ".join(parts)
 
     # ------------------------------------------------------------ tick logic
     def update_windows(self, st, symbol, price, epoch, logs):
@@ -206,7 +221,9 @@ class Bot:
                 outcome = "continuation"
             else:
                 outcome = "reversal"
-            st.stats[outcome] += 1
+
+            # per-direction bucket
+            st.stats[w.direction][outcome] += 1
 
             logs.append(
                 f"\nBIAS RESULT | {timestamp(epoch)} | {symbol} | "
@@ -260,22 +277,29 @@ class Bot:
 
             # Bias window mirrors the real trade: opens on the entry tick
             # (look ticks from now) and closes BIAS_WINDOW ticks later.
+            # It is recorded in the bucket of this streak's direction.
             st.windows.append(Window(direction, price if look == 0 else None, look))
 
             contract_type = infer_market_bias(
-                stats=st.stats, current_streak_direction=direction
+                stats=st.stats,
+                current_streak_direction=direction,
+                min_samples=MIN_SAMPLES,
+                min_edge=MIN_EDGE,
             )
+
+            bucket = st.stats[direction]
+            decided = bucket["continuation"] + bucket["reversal"]
 
             # ---- hot path: send BEFORE any printing ----
             if contract_type == "SKIP":
-                note = " | [SKIP] no bias data yet"
+                note = f" | [SKIP] {direction} bias not decisive (N={decided})"
             elif self.busy:
                 note = " | [SKIP] contract still open"
             else:
                 mode = await self.place_order(symbol, contract_type, st.tick_idx)
                 note = (
                     f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
-                    f"step {self.mg_step} | {mode}"
+                    f"step {self.mg_step} | {mode} | {direction}-bias N={decided}"
                 )
 
             note = (
@@ -429,12 +453,12 @@ class Bot:
                 self.mg_step += 1
                 return f"Next stake: {self.stake:.2f} USD (step {self.mg_step})."
 
-            self.stake, self.mg_step = BASE_STAKE, 0
             reason = (
                 "Maximum recovery steps reached"
                 if self.mg_step >= MAX_MARTINGALE_STEPS
                 else "Stake cap would be exceeded"
             )
+            self.stake, self.mg_step = BASE_STAKE, 0
             return f"[MARTINGALE] {reason}. Resetting to {BASE_STAKE:.2f} USD."
 
         self.unresolved += 1
@@ -493,8 +517,8 @@ class Bot:
         print(f"==========================================={emoji}")
         print(f"   TRADE RESOLVED | ID: {contract_id}    [URSVD {self.unresolved}]")
         print(f"   Result: {str(status).upper()}  [MXLS {self.longest_loss}]")
-        print(f"   Current P&L: {profit:+.2f} USD [MXPL {self.max_pl}]")
-        print(f"   Win rate: {win_rate:.0f}%      [MINPL {self.min_pl}]")
+        print(f"   Current P&L: {profit:+.2f} USD [MXPL {self.max_pl:.2f}]")
+        print(f"   Win rate: {win_rate:.0f}%      [MINPL {self.min_pl:.2f}]")
         print("==========================================")
         print(f"   Min bankroll: {min_bankroll} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
@@ -578,7 +602,8 @@ class Bot:
                     print(
                         f"STREAK={STREAK} | BIAS_WINDOW={BIAS_WINDOW} | "
                         f"LOOKAHEAD={self.lookahead} (auto={AUTO_LOOKAHEAD}) | "
-                        f"PROPOSALS={USE_PROPOSALS}"
+                        f"PROPOSALS={USE_PROPOSALS} | "
+                        f"MIN_SAMPLES={MIN_SAMPLES} | MIN_EDGE={MIN_EDGE}"
                     )
                     await self.on_connect()
                     delay = 2
