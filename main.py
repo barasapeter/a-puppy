@@ -600,9 +600,13 @@ class Bot:
         )
         print(f"==========================================={emoji}")
         print(f"   TRADE RESOLVED | ID: {contract_id}    [URSVD {self.unresolved}]")
-        print(f"   Result: {str(status).upper()}  [MXLS {self.longest_loss}]")
-        print(f"   Current P&L: {profit:+.2f} USD [MXPL {self.max_pl:.2f}]")
-        print(f"   Win rate: {win_rate:.0f}%      [MINPL {self.min_pl:.2f}]")
+        print(
+            f"   Result: {str(status).upper()}  MXLS{self.longest_loss} MXWS{self.longest_win}"
+        )
+        print(f"   Current P&L: {profit:+.2f} USD MXPL {self.max_pl:.2f}")
+        print(
+            f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
+        )
         print(f"   Segment: {seg_text}")  # [SEGMENT]
         print("==========================================")
         print(f"   Min bankroll: {min_bankroll} USD ")
