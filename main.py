@@ -21,6 +21,13 @@ Key ideas
 
 * The busy flag is set BEFORE the order is sent (no double orders while a buy
   confirmation is in flight) and is always released on errors / reconnects.
+
+* [SEGMENT] SLIDING STATS SEGMENTS: when a direction's decided samples
+  (continuation + reversal) reach SEGMENT_LIMIT, that direction's stats are
+  rebuilt from only its latest SEGMENT_KEEP decided outcomes and the segment
+  counter goes up.  The stats then grow again by (SEGMENT_LIMIT - SEGMENT_KEEP)
+  new samples until the limit is hit again, and so on.  Old regime data is
+  therefore discarded and never feeds the signal core as noise.
 """
 
 import asyncio
@@ -65,7 +72,13 @@ MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
 MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
-MIN_EDGE = 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+MIN_EDGE = 0.10  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+
+# [SEGMENT] Sliding stats segments (per direction)
+SEGMENT_ENABLED = True
+SEGMENT_LIMIT = 110  # when decided samples in a direction reach this -> new segment
+SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
+# Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP (110 - 10 = 100 new samples)
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
@@ -91,6 +104,17 @@ def new_stats():
     return {d: {"continuation": 0, "reversal": 0, "neutral": 0} for d in DIRECTIONS}
 
 
+# [SEGMENT] helpers
+def new_history():
+    """Per-direction ordered outcomes of the current segment."""
+    return {d: [] for d in DIRECTIONS}
+
+
+def new_segments():
+    """Per-direction segment counter (starts at segment 1)."""
+    return {d: 1 for d in DIRECTIONS}
+
+
 # --------------------------------------------------------------------------- #
 # State containers
 # --------------------------------------------------------------------------- #
@@ -112,6 +136,8 @@ class SymbolState:
     recent: deque = field(default_factory=lambda: deque(maxlen=30))  # (epoch, idx)
     windows: list = field(default_factory=list)
     stats: dict = field(default_factory=new_stats)
+    history: dict = field(default_factory=new_history)  # [SEGMENT]
+    segments: dict = field(default_factory=new_segments)  # [SEGMENT]
 
     def reset_stream(self):
         """Clear tick state after a reconnect (stats are kept for the session)."""
@@ -194,6 +220,54 @@ class Bot:
         parts = [cls._bucket_text(d, stats[d]) for d in DIRECTIONS]
         return f"SESSION BIAS | {symbol} | " + "  ||  ".join(parts)
 
+    # [SEGMENT] ---------------------------------------------------------
+    @staticmethod
+    def segment_text(st):
+        """e.g. 'UP seg 2 | DOWN seg 1'"""
+        return " | ".join(f"{d} seg {st.segments[d]}" for d in DIRECTIONS)
+
+    def roll_segment(self, st, symbol, direction, epoch, logs):
+        """
+        If this direction's decided samples reached SEGMENT_LIMIT, rebuild its
+        stats from the latest SEGMENT_KEEP decided outcomes and start the next
+        segment.
+        """
+        if not SEGMENT_ENABLED or SEGMENT_LIMIT <= 0:
+            return
+
+        bucket = st.stats[direction]
+        decided = bucket["continuation"] + bucket["reversal"]
+        if decided < SEGMENT_LIMIT:
+            return
+
+        keep_n = max(0, min(SEGMENT_KEEP, SEGMENT_LIMIT - 1))
+
+        kept, kept_decided = [], 0
+        for outcome in reversed(st.history[direction]):
+            if kept_decided >= keep_n:
+                break
+            kept.append(outcome)
+            if outcome != "neutral":
+                kept_decided += 1
+        kept.reverse()
+
+        # rebuild the bucket from the carried-over outcomes only
+        bucket["continuation"] = bucket["reversal"] = bucket["neutral"] = 0
+        for outcome in kept:
+            bucket[outcome] += 1
+        st.history[direction] = kept
+
+        old_seg = st.segments[direction]
+        st.segments[direction] = old_seg + 1
+
+        logs.append(
+            f"\n>>> SEGMENT CHANGE | {timestamp(epoch)} | {symbol} | {direction} | "
+            f"Segment {old_seg} -> {st.segments[direction]} | "
+            f"N reached {decided} -> kept latest {kept_decided} | "
+            f"Next segment ends at N={SEGMENT_LIMIT} "
+            f"(+{SEGMENT_LIMIT - kept_decided} samples)"
+        )
+
     # ------------------------------------------------------------ tick logic
     def update_windows(self, st, symbol, price, epoch, logs):
         """Resolve bias windows. Pure computation; log lines are buffered."""
@@ -224,6 +298,7 @@ class Bot:
 
             # per-direction bucket
             st.stats[w.direction][outcome] += 1
+            st.history[w.direction].append(outcome)  # [SEGMENT]
 
             logs.append(
                 f"\nBIAS RESULT | {timestamp(epoch)} | {symbol} | "
@@ -232,6 +307,9 @@ class Bot:
                 f"Window: {BIAS_WINDOW} ticks"
             )
             logs.append(self.stats_line(symbol, st.stats))
+
+            # [SEGMENT] slide the stats if this direction hit the limit
+            self.roll_segment(st, symbol, w.direction, epoch, logs)
 
         st.windows = keep
 
@@ -299,7 +377,8 @@ class Bot:
                 mode = await self.place_order(symbol, contract_type, st.tick_idx)
                 note = (
                     f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
-                    f"step {self.mg_step} | {mode} | {direction}-bias N={decided}"
+                    f"step {self.mg_step} | {mode} | {direction}-bias N={decided} | "
+                    f"seg {st.segments[direction]}"  # [SEGMENT]
                 )
 
             note = (
@@ -486,6 +565,11 @@ class Bot:
         if order is not None and order.contract_id == contract_id:
             lag = self.record_lag(order, poc.get("entry_tick_time"))
 
+        # [SEGMENT] capture segment info for the report
+        seg_symbol = order.symbol if order is not None else SYMBOLS[0]
+        seg_state = self.symbols.get(seg_symbol)
+        seg_text = self.segment_text(seg_state) if seg_state is not None else "n/a"
+
         old_stake = self.stake
         info = self.apply_result(status, profit)
         if info:
@@ -519,6 +603,7 @@ class Bot:
         print(f"   Result: {str(status).upper()}  [MXLS {self.longest_loss}]")
         print(f"   Current P&L: {profit:+.2f} USD [MXPL {self.max_pl:.2f}]")
         print(f"   Win rate: {win_rate:.0f}%      [MINPL {self.min_pl:.2f}]")
+        print(f"   Segment: {seg_text}")  # [SEGMENT]
         print("==========================================")
         print(f"   Min bankroll: {min_bankroll} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
@@ -604,6 +689,10 @@ class Bot:
                         f"LOOKAHEAD={self.lookahead} (auto={AUTO_LOOKAHEAD}) | "
                         f"PROPOSALS={USE_PROPOSALS} | "
                         f"MIN_SAMPLES={MIN_SAMPLES} | MIN_EDGE={MIN_EDGE}"
+                    )
+                    print(  # [SEGMENT]
+                        f"SEGMENTS={SEGMENT_ENABLED} | "
+                        f"SEGMENT_LIMIT={SEGMENT_LIMIT} | SEGMENT_KEEP={SEGMENT_KEEP}"
                     )
                     await self.on_connect()
                     delay = 2
