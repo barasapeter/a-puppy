@@ -34,6 +34,16 @@ Key ideas
   doubling then continues from that stake on losses; a win that leaves the net
   P&L >= 0 resets everything to BASE_STAKE.
 
+* [TIMEOUT] If a confirmed contract is still unresolved UNRESOLVED_TIMEOUT_TICKS
+  ticks after its buy confirmation, the circuit stays locked (busy) and the bot
+  asks the server for the contract's real status (one-shot proposal_open_contract),
+  one query per tick.  A settled answer goes through the normal resolution path
+  (real win/loss, JSON logs included).  Only after QUERY_MAX_FAILURES failed
+  queries (API error, no answer, or still not settled) is the contract treated
+  as an ASSUMED LOSS: it advances P&L / loss streak / martingale like a real
+  loss, URSVD goes up by one, the circuit reopens, and nothing is written to
+  the JSON logs.  A result that arrives afterwards is only reported.
+
 * [LOSSLOG] Every resolved contract is appended as a compact checkpoint report
   (signal tick, expected execution tick, confirmation / entry tick, direction
   checks, outcome, and a tick tape from the streak start to the exit).
@@ -102,6 +112,12 @@ MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
 
+# [TIMEOUT] unresolved-contract watchdog
+UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
+STATUS_QUERY_ENABLED = True  # ask the server for the real contract status first
+QUERY_MAX_FAILURES = 3  # failed status queries before falling back
+ASSUME_LOSS_ON_TIMEOUT = True  # final fallback: count the contract as lost
+
 # [RECOVERY] size the post-win stake so the net P&L is forced positive
 RECOVERY_ENABLED = True
 
@@ -113,6 +129,7 @@ WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
+REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
 DIRECTIONS = ("UP", "DOWN")
@@ -205,6 +222,9 @@ class Order:
     contract_id: int | None = None
     signal: dict | None = None  # [LOSSLOG] snapshot when the signal fired
     confirm_idx: int | None = None  # [LOSSLOG] tick idx when the buy was confirmed
+    query_attempts: int = 0  # [TIMEOUT] status queries sent
+    query_failures: int = 0  # [TIMEOUT] queries that errored / unanswered / unsettled
+    query_outstanding: bool = False  # [TIMEOUT] a query is awaiting its answer
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +244,7 @@ class Bot:
         self.busy = False  # True from "send" until resolved / failed
         self.order = None
         self.resolved = set()
+        self.assumed_losses = set()  # [TIMEOUT] contracts counted as assumed losses
         self.proposals = {}  # (symbol, contract_type) -> (proposal_id, stake)
 
         # money management
@@ -614,6 +635,9 @@ class Bot:
             }
         )
 
+        # [TIMEOUT] watchdog: free the circuit if a contract never resolved
+        await self.check_unresolved_timeout(st, symbol)
+
         if prev is None:
             print(f"{timestamp(epoch)} | {symbol} | {price} | Waiting")
             return
@@ -808,6 +832,144 @@ class Bot:
                 return lag
         return None
 
+    # [TIMEOUT] ---------------------------------------------------------
+    async def check_unresolved_timeout(self, st, symbol):
+        """
+        Called on every tick. Once a confirmed contract is overdue the circuit
+        stays locked while its real status is queried (one query per tick);
+        only QUERY_MAX_FAILURES failed queries lead to an assumed loss.
+        """
+        order = self.order
+        if (
+            not (STATUS_QUERY_ENABLED or ASSUME_LOSS_ON_TIMEOUT)
+            or order is None
+            or order.contract_id is None
+            or order.confirm_idx is None
+            or order.symbol != symbol
+        ):
+            return
+        waited = st.tick_idx - order.confirm_idx
+        if waited < UNRESOLVED_TIMEOUT_TICKS:
+            return
+
+        if STATUS_QUERY_ENABLED:
+            # the previous query got no answer before this tick: it failed
+            if order.query_outstanding:
+                order.query_outstanding = False
+                order.query_failures += 1
+                print(
+                    f"[QUERY] attempt {order.query_attempts}/{QUERY_MAX_FAILURES} "
+                    f"for contract {order.contract_id}: no answer"
+                )
+
+            if order.query_failures < QUERY_MAX_FAILURES:
+                order.query_attempts += 1
+                order.query_outstanding = True
+                print(
+                    f"\n[QUERY] Contract {order.contract_id} unresolved {waited} ticks "
+                    f"after confirmation | status query "
+                    f"{order.query_attempts}/{QUERY_MAX_FAILURES} | circuit stays locked"
+                )
+                await self.query_contract(order.contract_id)
+                return
+
+        if ASSUME_LOSS_ON_TIMEOUT:
+            await self.assume_loss(order, st, waited)
+
+    async def query_contract(self, contract_id):
+        """One-shot status request (no subscribe): bypasses a stalled stream."""
+        await self.send(
+            {
+                "proposal_open_contract": 1,
+                "contract_id": int(contract_id),
+                "req_id": REQ_POC_QUERY,
+            }
+        )
+
+    def on_query_unsettled(self, data, poc):
+        """A status query was answered, but the contract is not settled yet."""
+        if data.get("req_id") != REQ_POC_QUERY:
+            return
+        order = self.order
+        if (
+            order is None
+            or not order.query_outstanding
+            or poc.get("contract_id") != order.contract_id
+        ):
+            return
+        order.query_outstanding = False
+        order.query_failures += 1
+        print(
+            f"[QUERY] attempt {order.query_attempts}/{QUERY_MAX_FAILURES}: "
+            f"contract {order.contract_id} not settled yet "
+            f"(status: {poc.get('status')}, expired: {poc.get('is_expired')})"
+        )
+
+    async def assume_loss(self, order, st, waited):
+        """Treat an unresolved contract as lost and reopen the circuit."""
+        contract_id = order.contract_id
+        self.resolved.add(contract_id)  # a late result must not count twice
+        self.assumed_losses.add(contract_id)
+
+        old_stake = self.stake
+        profit = -old_stake
+        info = self.apply_result("lost", profit)
+        self.unresolved += 1
+        self.update_min_bankroll()
+
+        print(
+            f"\n[!] ASSUMED LOSS | Contract {contract_id} still unresolved "
+            f"{waited} ticks after confirmation | "
+            f"{order.query_failures} failed status queries | not written to JSON"
+        )
+        if info:
+            print(info)
+
+        decided = self.wins + self.losses
+        win_rate = self.wins / decided * 100 if decided else 0
+        target_status = (
+            "⏰"
+            if self.net_pl < TARGET_PL and self.target_hits == 0
+            else f"✅ [{self.target_hits}] [BSKT {self.basket:.2f} USD]"
+        )
+        emoji = "❗" * self.loss_streak + f" [CLS {self.loss_streak}]"
+
+        print(f"==========================================={emoji}")
+        print(
+            f"   TRADE RESOLVED (ASSUMED LOSS) | ID: {contract_id}    "
+            f"[URSVD {self.unresolved}]"
+        )
+        print(
+            f"   Result: LOST (ASSUMED)  MXLS{self.longest_loss} MXWS{self.longest_win}"
+        )
+        print(f"   Current P&L: {profit:+.2f} USD MXPL {self.max_pl:.2f}")
+        print(
+            f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
+        )
+        print(f"   Segment: {self.segment_text(st)}")
+        print("==========================================")
+        print(f"   Min bankroll: {self.min_bankroll:.2f} USD ")
+        print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
+        print("==========================================\n")
+
+        self.release()
+
+        if USE_PROPOSALS and self.stake != old_stake:
+            await self.refresh_proposals()
+
+    async def on_late_poc(self, data, poc, contract_id):
+        """A contract already counted as an assumed loss reported back."""
+        sub_id = (data.get("subscription") or {}).get("id")
+        if sub_id:
+            await self.send({"forget": sub_id})
+        if poc.get("is_sold"):
+            self.assumed_losses.discard(contract_id)
+            print(
+                f"[LATE RESULT] Contract {contract_id} finally resolved: "
+                f"{str(poc.get('status')).upper()} {_to_float(poc.get('profit'))} USD "
+                f"(ignored: already counted as an assumed loss)"
+            )
+
     def update_min_bankroll(self):
         """[RECOVERY] Peak capital needed: amount lost so far + next stake."""
         need = max(0.0, -self.net_pl) + self.stake
@@ -872,7 +1034,14 @@ class Bot:
 
     async def on_poc(self, data):
         poc = data.get("proposal_open_contract") or {}
+
+        late_id = poc.get("contract_id")  # [TIMEOUT]
+        if late_id is not None and late_id in self.assumed_losses:
+            await self.on_late_poc(data, poc, late_id)
+            return
+
         if not poc.get("is_sold"):
+            self.on_query_unsettled(data, poc)  # [TIMEOUT]
             return
 
         contract_id = poc.get("contract_id")
@@ -883,6 +1052,10 @@ class Bot:
         sub_id = (data.get("subscription") or {}).get("id")
         if sub_id:
             await self.send({"forget": sub_id})
+        elif data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
+            # one-shot reply carries no subscription id: drop the stalled stream
+            await self.send({"forget_all": "proposal_open_contract"})
+            print(f"[QUERY] Contract {contract_id} resolved via status query")
 
         status = poc.get("status")
         profit = float(poc.get("profit", 0.0))
@@ -964,6 +1137,16 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
+        if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
+            order = self.order
+            if order is not None and order.query_outstanding:
+                order.query_outstanding = False
+                order.query_failures += 1
+                print(
+                    f"[QUERY] attempt {order.query_attempts}/{QUERY_MAX_FAILURES} "
+                    f"for contract {order.contract_id}: API error"
+                )
+            return
         # A failed buy must not leave the bot blocked forever.
         if data.get("req_id") == REQ_BUY and (
             self.order is None or self.order.contract_id is None
@@ -1034,6 +1217,12 @@ class Bot:
                     print(  # [SEGMENT]
                         f"SEGMENTS={SEGMENT_ENABLED} | "
                         f"SEGMENT_LIMIT={SEGMENT_LIMIT} | SEGMENT_KEEP={SEGMENT_KEEP}"
+                    )
+                    print(  # [TIMEOUT]
+                        f"UNRESOLVED_TIMEOUT_TICKS={UNRESOLVED_TIMEOUT_TICKS} | "
+                        f"STATUS_QUERY={STATUS_QUERY_ENABLED} "
+                        f"(max failures {QUERY_MAX_FAILURES}) | "
+                        f"ASSUME_LOSS_ON_TIMEOUT={ASSUME_LOSS_ON_TIMEOUT}"
                     )
                     print(  # [LOSSLOG]
                         f"LOSS_LOG={LOSS_LOG_ENABLED} | LOSS_LOG_FILE={LOSS_LOG_FILE} | "
