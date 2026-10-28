@@ -26,12 +26,18 @@ Key ideas
   (continuation + reversal) reach SEGMENT_LIMIT, that direction's stats are
   rebuilt from only its latest SEGMENT_KEEP decided outcomes and the segment
   counter goes up.  The stats then grow again by (SEGMENT_LIMIT - SEGMENT_KEEP)
-  new samples until the limit is hit again, and so on.  Old regime data is
-  therefore discarded and never feeds the signal core as noise.
+  new samples until the limit is hit again, and so on.
+
+* [LOSSLOG] Every resolved contract is appended as a compact checkpoint report
+  (signal tick, expected execution tick, confirmation / entry tick, direction
+  checks, outcome, and a tick tape from the streak start to the exit).
+  LOST contracts go to LOSS_LOG_FILE, WON contracts to WIN_LOG_FILE (both JSON
+  arrays).  Purely observational.
 """
 
 import asyncio
 import json
+import os
 import time
 import traceback
 from collections import deque
@@ -78,7 +84,7 @@ MIN_EDGE = 0.10  # 0.05  # min gap between reversal and continuation rate (0.05 
 SEGMENT_ENABLED = True
 SEGMENT_LIMIT = 60  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
-# Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP (110 - 10 = 100 new samples)
+# Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
@@ -88,6 +94,13 @@ MARTINGALE_MULTIPLIER = 2.0
 MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
+
+# [LOSSLOG]
+LOSS_LOG_ENABLED = True
+LOSS_LOG_FILE = "loss_events.json"  # JSON array, one object per lost trade
+WIN_LOG_ENABLED = True
+WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
+TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
@@ -115,6 +128,28 @@ def new_segments():
     return {d: 1 for d in DIRECTIONS}
 
 
+# [LOSSLOG] helpers
+def _to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_tick(t):
+    """'07:10:29 | 1170.03 | UP [2]'"""
+    if t is None:
+        return None
+    return f"{timestamp(t['epoch'])} | {t['price']} | {t['dir']} [{t['cnt']}]"
+
+
 # --------------------------------------------------------------------------- #
 # State containers
 # --------------------------------------------------------------------------- #
@@ -138,6 +173,8 @@ class SymbolState:
     stats: dict = field(default_factory=new_stats)
     history: dict = field(default_factory=new_history)  # [SEGMENT]
     segments: dict = field(default_factory=new_segments)  # [SEGMENT]
+    # [LOSSLOG] rolling tape: {"idx", "epoch", "price", "dir", "cnt"}
+    tick_log: deque = field(default_factory=lambda: deque(maxlen=TICK_LOG_SIZE))
 
     def reset_stream(self):
         """Clear tick state after a reconnect (stats are kept for the session)."""
@@ -156,6 +193,8 @@ class Order:
     signal_idx: int
     t_sent: float
     contract_id: int | None = None
+    signal: dict | None = None  # [LOSSLOG] snapshot when the signal fired
+    confirm_idx: int | None = None  # [LOSSLOG] tick idx when the buy was confirmed
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +307,225 @@ class Bot:
             f"(+{SEGMENT_LIMIT - kept_decided} samples)"
         )
 
+    # [LOSSLOG] ---------------------------------------------------------
+    def build_signal_info(self, st, direction, contract_type, mode, look, decided):
+        """Light snapshot of the signal tick. Called AFTER the order is sent."""
+        try:
+            bucket = st.stats[direction]
+            last = st.tick_log[-1]
+            return {
+                "idx": last["idx"],
+                "direction": direction,
+                "real_streak": st.count,
+                "assumed": look,
+                "contract": contract_type,
+                "stake": self.stake,
+                "step": self.mg_step,
+                "mode": mode,
+                "bias": {
+                    "dir": direction,
+                    "cont": bucket["continuation"],
+                    "rev": bucket["reversal"],
+                    "N": decided,
+                    "seg": st.segments[direction],
+                },
+            }
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def _tick_by_idx(st, idx):
+        for t in st.tick_log:
+            if t["idx"] == idx:
+                return t
+        return None
+
+    def build_trade_record(self, order, poc, contract_id, kind):
+        """Compact checkpoint report for one resolved trade (kind: loss / win)."""
+        st = self.symbols.get(order.symbol) if order is not None else None
+        sig = order.signal if order is not None else None
+
+        base = {
+            "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            f"{kind}_no": self.losses if kind == "loss" else self.wins,
+            # consecutive-result count INCLUDING this trade (apply_result has run)
+            f"on_{kind}_streak": (
+                self.loss_streak if kind == "loss" else self.win_streak
+            ),
+            "contract_id": contract_id,
+            "symbol": order.symbol if order is not None else None,
+        }
+        if st is None or sig is None:
+            base["note"] = "signal context unavailable (e.g. reconnect mid-trade)"
+            base["outcome"] = self._outcome(poc)
+            return base
+
+        sig_idx = sig["idx"]
+        look = sig["assumed"]
+        sdir = sig["direction"]
+        exp_idx = sig_idx + look
+
+        entry_time = _to_int(poc.get("entry_tick_time"))
+        exit_time = _to_int(poc.get("exit_tick_time"))
+        entry_spot = _to_float(poc.get("entry_spot"))
+        exit_spot = _to_float(poc.get("exit_spot"))
+
+        # ---- locate the real entry tick (epoch match, else price match) ----
+        entry_t = None
+        for t in st.tick_log:
+            if t["idx"] > sig_idx and entry_time is not None and t["epoch"] == entry_time:
+                entry_t = t
+                break
+        if entry_t is None and entry_spot is not None:
+            for t in st.tick_log:
+                if t["idx"] > sig_idx and t["price"] == entry_spot:
+                    entry_t = t
+                    break
+
+        # ---- locate the exit tick ----
+        exit_t = None
+        if entry_t is not None:
+            for t in st.tick_log:
+                if t["idx"] <= entry_t["idx"]:
+                    continue
+                if (exit_time is not None and t["epoch"] == exit_time) or (
+                    exit_time is None and exit_spot is not None and t["price"] == exit_spot
+                ):
+                    exit_t = t
+                    break
+
+        sig_t = self._tick_by_idx(st, sig_idx)
+        exp_t = self._tick_by_idx(st, exp_idx)
+        conf_t = (
+            self._tick_by_idx(st, order.confirm_idx)
+            if order.confirm_idx is not None
+            else None
+        )
+
+        # ---- direction checks ----
+        exp_ok = None if exp_t is None else exp_t["dir"] == sdir
+        entry_ok = None if entry_t is None else entry_t["dir"] == sdir
+        virtual_held = None
+        if entry_t is not None:
+            between = [
+                t for t in st.tick_log if sig_idx < t["idx"] <= entry_t["idx"]
+            ]
+            virtual_held = bool(between) and all(t["dir"] == sdir for t in between)
+
+        # ---- tape: streak start -> exit, tagged ----
+        start_idx = sig_idx - sig["real_streak"] + 1
+        end_idx = exit_t["idx"] if exit_t is not None else st.tick_idx
+        tags = {}
+
+        def tag(idx, label):
+            if idx is not None:
+                tags.setdefault(idx, []).append(label)
+
+        tag(sig_idx, "SIGNAL")
+        tag(exp_idx, "EXPECTED")
+        tag(order.confirm_idx, "CONFIRMED")
+        tag(entry_t["idx"] if entry_t else None, "ENTRY")
+        tag(exit_t["idx"] if exit_t else None, "EXIT")
+        tape = []
+        for t in st.tick_log:
+            if start_idx <= t["idx"] <= end_idx:
+                line = _fmt_tick(t)
+                if t["idx"] in tags:
+                    line += "  <- " + "+".join(tags[t["idx"]])
+                tape.append(line)
+
+        record = dict(base)
+        record["1_signal"] = {
+            "tick": _fmt_tick(sig_t),
+            "price": sig_t["price"] if sig_t else None,
+            "streak": f"{sdir} real {sig['real_streak']} + assumed {look}",
+            "order": f"{sig['contract']} stake {sig['stake']:.2f} step {sig['step']} ({sig['mode']})",
+            "bias": sig["bias"],
+        }
+        record["2_expected_tick"] = {
+            "tick": _fmt_tick(exp_t),
+            "price": exp_t["price"] if exp_t else None,
+            "matches_streak_dir": exp_ok,
+        }
+        record["3_execution"] = {
+            "confirmed_tick": _fmt_tick(conf_t),
+            "confirmed_at_expected_tick": (
+                None if order.confirm_idx is None else order.confirm_idx == exp_idx
+            ),
+            "entry_tick": _fmt_tick(entry_t),
+            "entry_at_expected_tick": (
+                None if entry_t is None else entry_t["idx"] == exp_idx
+            ),
+            "entry_ticks_after_expected": (
+                None if entry_t is None else entry_t["idx"] - exp_idx
+            ),
+            "entry_ticks_after_signal": (
+                None if entry_t is None else entry_t["idx"] - sig_idx
+            ),
+        }
+        record["4_direction_check"] = {
+            "expected_tick_matched_streak": exp_ok,
+            "entry_tick_matched_streak": entry_ok,
+            "virtual_streak_held_until_entry": virtual_held,
+        }
+        record["outcome"] = self._outcome(poc)
+        record["tape"] = tape
+        return record
+
+    @staticmethod
+    def _outcome(poc):
+        entry = _to_float(poc.get("entry_spot"))
+        exit_ = _to_float(poc.get("exit_spot"))
+        return {
+            "entry": entry,
+            "exit": exit_,
+            "exit_minus_entry": (
+                None if entry is None or exit_ is None else round(exit_ - entry, 8)
+            ),
+            "profit": _to_float(poc.get("profit")),
+        }
+
+    @staticmethod
+    def save_record(record, path):
+        """Append one record to the JSON array file (atomic replace)."""
+        data = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    raise ValueError("loss log is not a JSON array")
+            except Exception:
+                backup = f"{path}.corrupt-{int(time.time())}"
+                os.replace(path, backup)
+                print(f"[LOSSLOG] unreadable log moved to {backup}")
+                data = []
+
+        data.append(record)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def log_trade(self, order, poc, contract_id, status):
+        """Never raises: logging must not disturb trading."""
+        if status == "lost":
+            kind, enabled, path, count = "loss", LOSS_LOG_ENABLED, LOSS_LOG_FILE, self.losses
+        elif status == "won":
+            kind, enabled, path, count = "win", WIN_LOG_ENABLED, WIN_LOG_FILE, self.wins
+        else:
+            return
+        if not enabled:
+            return
+        try:
+            record = self.build_trade_record(order, poc, contract_id, kind)
+            self.save_record(record, path)
+            print(f"[LOSSLOG] {kind} #{count} saved -> {path}")
+        except Exception as error:
+            traceback.print_exc()
+            print(f"[LOSSLOG] failed to save {kind} record: {error}")
+
     # ------------------------------------------------------------ tick logic
     def update_windows(self, st, symbol, price, epoch, logs):
         """Resolve bias windows. Pure computation; log lines are buffered."""
@@ -326,6 +584,25 @@ class Bot:
         st.recent.append((epoch, st.tick_idx))
         prev, st.prev = st.prev, price
 
+        # [LOSSLOG] rolling tape (observational only); "cnt" is filled below
+        if prev is None:
+            tape_dir = "-"
+        elif price > prev:
+            tape_dir = "UP"
+        elif price < prev:
+            tape_dir = "DOWN"
+        else:
+            tape_dir = "FLAT"
+        st.tick_log.append(
+            {
+                "idx": st.tick_idx,
+                "epoch": epoch,
+                "price": price,
+                "dir": tape_dir,
+                "cnt": 0,
+            }
+        )
+
         if prev is None:
             print(f"{timestamp(epoch)} | {symbol} | {price} | Waiting")
             return
@@ -347,6 +624,8 @@ class Bot:
             st.count += 1
         else:
             st.direction, st.count, st.alerted = direction, 1, False
+
+        st.tick_log[-1]["cnt"] = st.count  # [LOSSLOG]
 
         note = ""
         if st.count >= self.trigger_count() and not st.alerted:
@@ -375,6 +654,13 @@ class Bot:
                 note = " | [SKIP] contract still open"
             else:
                 mode = await self.place_order(symbol, contract_type, st.tick_idx)
+
+                # [LOSSLOG] attach the signal snapshot AFTER the send
+                if LOSS_LOG_ENABLED and self.order is not None:
+                    self.order.signal = self.build_signal_info(
+                        st, direction, contract_type, mode, look, decided
+                    )
+
                 note = (
                     f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
                     f"step {self.mg_step} | {mode} | {direction}-bias N={decided} | "
@@ -482,6 +768,11 @@ class Bot:
         balance = info.get("balance_after")
         balance_text = f"{float(balance):.2f} USD" if balance is not None else "n/a"
 
+        # [LOSSLOG] the latest tick received when the confirmation arrived
+        st = self.symbols.get(order.symbol)
+        if st is not None:
+            order.confirm_idx = st.tick_idx
+
         await self.subscribe_contract(contract_id)
         print(
             f"\n[+] ORDER CONFIRMED | Contract ID: {contract_id} | "
@@ -574,6 +865,16 @@ class Bot:
         info = self.apply_result(status, profit)
         if info:
             print(info)
+
+        # [LOSSLOG] losses -> loss file, wins -> win file; the order must be
+        # the one that just resolved
+        if status in ("lost", "won"):
+            trade_order = (
+                order
+                if order is not None and order.contract_id == contract_id
+                else None
+            )
+            self.log_trade(trade_order, poc, contract_id, status)
 
         # ---- report ----
         decided = self.wins + self.losses
@@ -697,6 +998,10 @@ class Bot:
                     print(  # [SEGMENT]
                         f"SEGMENTS={SEGMENT_ENABLED} | "
                         f"SEGMENT_LIMIT={SEGMENT_LIMIT} | SEGMENT_KEEP={SEGMENT_KEEP}"
+                    )
+                    print(  # [LOSSLOG]
+                        f"LOSS_LOG={LOSS_LOG_ENABLED} | LOSS_LOG_FILE={LOSS_LOG_FILE} | "
+                        f"WIN_LOG={WIN_LOG_ENABLED} | WIN_LOG_FILE={WIN_LOG_FILE}"
                     )
                     await self.on_connect()
                     delay = 2
