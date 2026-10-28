@@ -28,6 +28,12 @@ Key ideas
   counter goes up.  The stats then grow again by (SEGMENT_LIMIT - SEGMENT_KEEP)
   new samples until the limit is hit again, and so on.
 
+* [RECOVERY] After a WIN, if the net P&L is still negative (long losing streak
+  and payout < 100%), the next stake is sized so that one more win lifts the
+  net P&L above zero:  stake = deficit / payout_rate + BASE_STAKE.  Martingale
+  doubling then continues from that stake on losses; a win that leaves the net
+  P&L >= 0 resets everything to BASE_STAKE.
+
 * [LOSSLOG] Every resolved contract is appended as a compact checkpoint report
   (signal tick, expected execution tick, confirmation / entry tick, direction
   checks, outcome, and a tick tape from the streak start to the exit).
@@ -37,6 +43,7 @@ Key ideas
 
 import asyncio
 import json
+import math
 import os
 import time
 import traceback
@@ -94,6 +101,9 @@ MARTINGALE_MULTIPLIER = 2.0
 MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
+
+# [RECOVERY] size the post-win stake so the net P&L is forced positive
+RECOVERY_ENABLED = True
 
 # [LOSSLOG]
 LOSS_LOG_ENABLED = True
@@ -227,6 +237,7 @@ class Bot:
         self.longest_win = self.longest_loss = 0
         self.target_hits = 0
         self.basket = 0.0
+        self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
 
     # ----------------------------------------------------------------- utils
     def trigger_count(self):
@@ -797,6 +808,12 @@ class Bot:
                 return lag
         return None
 
+    def update_min_bankroll(self):
+        """[RECOVERY] Peak capital needed: amount lost so far + next stake."""
+        need = max(0.0, -self.net_pl) + self.stake
+        if need > self.min_bankroll:
+            self.min_bankroll = need
+
     def apply_result(self, status, profit):
         """Update P&L and martingale state. Returns an info message."""
         self.net_pl += profit
@@ -808,7 +825,26 @@ class Bot:
             self.win_streak += 1
             self.loss_streak = 0
             self.longest_win = max(self.longest_win, self.win_streak)
+            traded_stake = self.stake  # stake of the trade that just won
             self.stake, self.mg_step = BASE_STAKE, 0
+
+            # [RECOVERY] still below zero after a win -> size the next stake
+            # so a single win recovers the deficit and ends above zero.
+            if RECOVERY_ENABLED and self.net_pl < 0 and profit > 0 and traded_stake > 0:
+                rate = profit / traded_stake  # realised payout rate
+                deficit = -self.net_pl
+                recover_part = deficit / rate
+                stake = math.ceil(round((recover_part + BASE_STAKE) * 100, 6)) / 100
+                capped = stake > MAX_STAKE
+                self.stake = min(stake, MAX_STAKE)
+                return (
+                    f"[RECOVERY] Net P&L {self.net_pl:+.2f} USD still negative after win. "
+                    f"Next stake: {self.stake:.2f} USD = {recover_part:.2f} "
+                    f"(recover {deficit:.2f} @ {rate * 100:.0f}% payout) + "
+                    f"{BASE_STAKE:.2f} (base)"
+                    + (" [capped at MAX_STAKE]" if capped else "")
+                    + "."
+                )
             return f"Stake reset to {self.stake:.2f} USD."
 
         if status == "lost":
@@ -863,6 +899,7 @@ class Bot:
 
         old_stake = self.stake
         info = self.apply_result(status, profit)
+        self.update_min_bankroll()  # [RECOVERY]
         if info:
             print(info)
 
@@ -879,8 +916,7 @@ class Bot:
         # ---- report ----
         decided = self.wins + self.losses
         win_rate = self.wins / decided * 100 if decided else 0
-        mult = MARTINGALE_MULTIPLIER
-        min_bankroll = BASE_STAKE * (mult ** (self.longest_loss + 1) - 1) / (mult - 1)
+        min_bankroll = self.min_bankroll  # [RECOVERY] deficit + next stake, peak
 
         target_status = (
             "⏰"
@@ -910,7 +946,7 @@ class Bot:
         )
         print(f"   Segment: {seg_text}")  # [SEGMENT]
         print("==========================================")
-        print(f"   Min bankroll: {min_bankroll} USD ")
+        print(f"   Min bankroll: {min_bankroll:.2f} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
         print("==========================================\n")
 
