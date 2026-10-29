@@ -1,0 +1,655 @@
+[
+  {
+    "logged_at": "2026-10-28T17:15:55+00:00",
+    "win_no": 34,
+    "on_win_streak": 3,
+    "contract_id": 18623588939,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:15:53 | 1197.68 | UP [5]",
+      "price": 1197.68,
+      "streak": "UP real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "UP",
+        "cont": 6,
+        "rev": 9,
+        "N": 15,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:15:54 | 1197.44 | DOWN [1]",
+      "price": 1197.44,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:15:53 | 1197.68 | UP [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:15:54 | 1197.44 | DOWN [1]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1197.44,
+      "exit": 1197.35,
+      "exit_minus_entry": -0.09,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:15:49 | 1197.17 | UP [1]",
+      "17:15:50 | 1197.37 | UP [2]",
+      "17:15:51 | 1197.43 | UP [3]",
+      "17:15:52 | 1197.58 | UP [4]",
+      "17:15:53 | 1197.68 | UP [5]  <- SIGNAL+CONFIRMED",
+      "17:15:54 | 1197.44 | DOWN [1]  <- EXPECTED+ENTRY",
+      "17:15:55 | 1197.35 | DOWN [2]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:15:55+00:00",
+    "win_no": 28,
+    "on_win_streak": 4,
+    "contract_id": 18623588719,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:15:53 | 1197.68 | UP [5]",
+      "price": 1197.68,
+      "streak": "UP real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "UP",
+        "cont": 6,
+        "rev": 9,
+        "N": 15,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:15:54 | 1197.44 | DOWN [1]",
+      "price": 1197.44,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:15:53 | 1197.68 | UP [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:15:54 | 1197.44 | DOWN [1]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1197.44,
+      "exit": 1197.35,
+      "exit_minus_entry": -0.09,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:15:49 | 1197.17 | UP [1]",
+      "17:15:50 | 1197.37 | UP [2]",
+      "17:15:51 | 1197.43 | UP [3]",
+      "17:15:52 | 1197.58 | UP [4]",
+      "17:15:53 | 1197.68 | UP [5]  <- SIGNAL+CONFIRMED",
+      "17:15:54 | 1197.44 | DOWN [1]  <- EXPECTED+ENTRY",
+      "17:15:55 | 1197.35 | DOWN [2]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:17:27+00:00",
+    "win_no": 48,
+    "on_win_streak": 1,
+    "contract_id": 18623712099,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:17:00 | 1197.12 | UP [5]",
+      "price": 1197.12,
+      "streak": "UP real 5 + assumed 1",
+      "order": "PUT stake 4.00 step 2 (direct)",
+      "bias": {
+        "dir": "UP",
+        "cont": 50,
+        "rev": 56,
+        "N": 106,
+        "seg": 1
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:17:01 | 1197.27 | UP [6]",
+      "price": 1197.27,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:17:05 | 1197.37 | UP [1]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:17:06 | 1197.65 | UP [2]",
+      "entry_at_expected_tick": false,
+      "entry_ticks_after_expected": 5,
+      "entry_ticks_after_signal": 6
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1197.65,
+      "exit": 1197.53,
+      "exit_minus_entry": -0.12,
+      "profit": 3.6
+    },
+    "tape": [
+      "17:16:56 | 1196.78 | UP [1]",
+      "17:16:57 | 1196.95 | UP [2]",
+      "17:16:58 | 1197.08 | UP [3]",
+      "17:16:59 | 1197.09 | UP [4]",
+      "17:17:00 | 1197.12 | UP [5]  <- SIGNAL",
+      "17:17:01 | 1197.27 | UP [6]  <- EXPECTED",
+      "17:17:02 | 1197.19 | DOWN [1]",
+      "17:17:03 | 1197.03 | DOWN [2]",
+      "17:17:04 | 1197.0 | DOWN [3]",
+      "17:17:05 | 1197.37 | UP [1]  <- CONFIRMED",
+      "17:17:06 | 1197.65 | UP [2]  <- ENTRY",
+      "17:17:07 | 1197.53 | DOWN [1]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:17:27+00:00",
+    "win_no": 29,
+    "on_win_streak": 5,
+    "contract_id": 18623712199,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:17:00 | 1197.12 | UP [5]",
+      "price": 1197.12,
+      "streak": "UP real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "UP",
+        "cont": 6,
+        "rev": 10,
+        "N": 16,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:17:01 | 1197.27 | UP [6]",
+      "price": 1197.27,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:17:05 | 1197.37 | UP [1]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:17:06 | 1197.65 | UP [2]",
+      "entry_at_expected_tick": false,
+      "entry_ticks_after_expected": 5,
+      "entry_ticks_after_signal": 6
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1197.65,
+      "exit": 1197.53,
+      "exit_minus_entry": -0.12,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:16:56 | 1196.78 | UP [1]",
+      "17:16:57 | 1196.95 | UP [2]",
+      "17:16:58 | 1197.08 | UP [3]",
+      "17:16:59 | 1197.09 | UP [4]",
+      "17:17:00 | 1197.12 | UP [5]  <- SIGNAL",
+      "17:17:01 | 1197.27 | UP [6]  <- EXPECTED",
+      "17:17:02 | 1197.19 | DOWN [1]",
+      "17:17:03 | 1197.03 | DOWN [2]",
+      "17:17:04 | 1197.0 | DOWN [3]",
+      "17:17:05 | 1197.37 | UP [1]  <- CONFIRMED",
+      "17:17:06 | 1197.65 | UP [2]  <- ENTRY",
+      "17:17:07 | 1197.53 | DOWN [1]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:18:46+00:00",
+    "win_no": 49,
+    "on_win_streak": 1,
+    "contract_id": 18623880999,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:18:41 | 1196.46 | DOWN [5]",
+      "price": 1196.46,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "PUT stake 2.00 step 1 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 44,
+        "rev": 39,
+        "N": 83,
+        "seg": 1
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:18:42 | 1196.69 | UP [1]",
+      "price": 1196.69,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:18:43 | 1196.37 | DOWN [1]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:18:44 | 1196.79 | UP [1]",
+      "entry_at_expected_tick": false,
+      "entry_ticks_after_expected": 2,
+      "entry_ticks_after_signal": 3
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1196.79,
+      "exit": 1196.44,
+      "exit_minus_entry": -0.35,
+      "profit": 1.8
+    },
+    "tape": [
+      "17:18:37 | 1197.21 | DOWN [1]",
+      "17:18:38 | 1197.06 | DOWN [2]",
+      "17:18:39 | 1196.88 | DOWN [3]",
+      "17:18:40 | 1196.85 | DOWN [4]",
+      "17:18:41 | 1196.46 | DOWN [5]  <- SIGNAL",
+      "17:18:42 | 1196.69 | UP [1]  <- EXPECTED",
+      "17:18:43 | 1196.37 | DOWN [1]  <- CONFIRMED",
+      "17:18:44 | 1196.79 | UP [1]  <- ENTRY",
+      "17:18:45 | 1196.44 | DOWN [1]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:19:08+00:00",
+    "win_no": 50,
+    "on_win_streak": 2,
+    "contract_id": 18623920019,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:19:04 | 1195.14 | DOWN [5]",
+      "price": 1195.14,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 45,
+        "rev": 39,
+        "N": 84,
+        "seg": 1
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:19:05 | 1194.87 | DOWN [6]",
+      "price": 1194.87,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:19:06 | 1194.94 | UP [1]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:19:05 | 1194.87 | DOWN [6]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": true
+    },
+    "outcome": {
+      "entry": 1194.87,
+      "exit": 1194.84,
+      "exit_minus_entry": -0.03,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:19:00 | 1196.48 | DOWN [1]",
+      "17:19:01 | 1195.98 | DOWN [2]",
+      "17:19:02 | 1195.55 | DOWN [3]",
+      "17:19:03 | 1195.23 | DOWN [4]",
+      "17:19:04 | 1195.14 | DOWN [5]  <- SIGNAL",
+      "17:19:05 | 1194.87 | DOWN [6]  <- EXPECTED+ENTRY",
+      "17:19:06 | 1194.94 | UP [1]  <- CONFIRMED",
+      "17:19:07 | 1194.87 | DOWN [1]",
+      "17:19:08 | 1194.84 | DOWN [2]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:19:32+00:00",
+    "win_no": 51,
+    "on_win_streak": 3,
+    "contract_id": 18623958359,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:19:29 | 1194.79 | DOWN [5]",
+      "price": 1194.79,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 45,
+        "rev": 40,
+        "N": 85,
+        "seg": 1
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:19:30 | 1194.81 | UP [1]",
+      "price": 1194.81,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:19:29 | 1194.79 | DOWN [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:19:30 | 1194.81 | UP [1]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1194.81,
+      "exit": 1194.74,
+      "exit_minus_entry": -0.07,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:19:25 | 1195.17 | DOWN [1]",
+      "17:19:26 | 1195.16 | DOWN [2]",
+      "17:19:27 | 1195.05 | DOWN [3]",
+      "17:19:28 | 1194.85 | DOWN [4]",
+      "17:19:29 | 1194.79 | DOWN [5]  <- SIGNAL+CONFIRMED",
+      "17:19:30 | 1194.81 | UP [1]  <- EXPECTED+ENTRY",
+      "17:19:31 | 1194.74 | DOWN [1]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:19:38+00:00",
+    "win_no": 35,
+    "on_win_streak": 1,
+    "contract_id": 18623968979,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:19:35 | 1193.78 | DOWN [5]",
+      "price": 1193.78,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "CALL stake 32.00 step 5 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 6,
+        "rev": 8,
+        "N": 14,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:19:36 | 1193.97 | UP [1]",
+      "price": 1193.97,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:19:35 | 1193.78 | DOWN [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:19:36 | 1193.97 | UP [1]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1193.97,
+      "exit": 1194.36,
+      "exit_minus_entry": 0.39,
+      "profit": 28.84
+    },
+    "tape": [
+      "17:19:31 | 1194.74 | DOWN [1]",
+      "17:19:32 | 1194.65 | DOWN [2]",
+      "17:19:33 | 1194.63 | DOWN [3]",
+      "17:19:34 | 1194.39 | DOWN [4]",
+      "17:19:35 | 1193.78 | DOWN [5]  <- SIGNAL+CONFIRMED",
+      "17:19:36 | 1193.97 | UP [1]  <- EXPECTED+ENTRY",
+      "17:19:37 | 1194.36 | UP [2]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:19:38+00:00",
+    "win_no": 30,
+    "on_win_streak": 1,
+    "contract_id": 18623968899,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:19:35 | 1193.78 | DOWN [5]",
+      "price": 1193.78,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "CALL stake 16.00 step 4 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 4,
+        "rev": 7,
+        "N": 11,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:19:36 | 1193.97 | UP [1]",
+      "price": 1193.97,
+      "matches_streak_dir": false
+    },
+    "3_execution": {
+      "confirmed_tick": "17:19:35 | 1193.78 | DOWN [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:19:36 | 1193.97 | UP [1]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": false,
+      "entry_tick_matched_streak": false,
+      "virtual_streak_held_until_entry": false
+    },
+    "outcome": {
+      "entry": 1193.97,
+      "exit": 1194.36,
+      "exit_minus_entry": 0.39,
+      "profit": 14.42
+    },
+    "tape": [
+      "17:19:31 | 1194.74 | DOWN [1]",
+      "17:19:32 | 1194.65 | DOWN [2]",
+      "17:19:33 | 1194.63 | DOWN [3]",
+      "17:19:34 | 1194.39 | DOWN [4]",
+      "17:19:35 | 1193.78 | DOWN [5]  <- SIGNAL+CONFIRMED",
+      "17:19:36 | 1193.97 | UP [1]  <- EXPECTED+ENTRY",
+      "17:19:37 | 1194.36 | UP [2]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:20:05+00:00",
+    "win_no": 52,
+    "on_win_streak": 1,
+    "contract_id": 18624016739,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:20:03 | 1194.31 | DOWN [5]",
+      "price": 1194.31,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "PUT stake 2.00 step 1 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 46,
+        "rev": 41,
+        "N": 87,
+        "seg": 1
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:20:04 | 1194.22 | DOWN [6]",
+      "price": 1194.22,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:20:03 | 1194.31 | DOWN [5]",
+      "confirmed_at_expected_tick": false,
+      "entry_tick": "17:20:04 | 1194.22 | DOWN [6]",
+      "entry_at_expected_tick": true,
+      "entry_ticks_after_expected": 0,
+      "entry_ticks_after_signal": 1
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": true
+    },
+    "outcome": {
+      "entry": 1194.22,
+      "exit": 1193.88,
+      "exit_minus_entry": -0.34,
+      "profit": 1.8
+    },
+    "tape": [
+      "17:19:59 | 1195.29 | DOWN [1]",
+      "17:20:00 | 1195.25 | DOWN [2]",
+      "17:20:01 | 1195.03 | DOWN [3]",
+      "17:20:02 | 1194.91 | DOWN [4]",
+      "17:20:03 | 1194.31 | DOWN [5]  <- SIGNAL+CONFIRMED",
+      "17:20:04 | 1194.22 | DOWN [6]  <- EXPECTED+ENTRY",
+      "17:20:05 | 1193.88 | DOWN [7]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:20:27+00:00",
+    "win_no": 31,
+    "on_win_streak": 1,
+    "contract_id": 18624048459,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:20:22 | 1193.48 | DOWN [5]",
+      "price": 1193.48,
+      "streak": "DOWN real 5 + assumed 1",
+      "order": "CALL stake 2.00 step 1 (direct)",
+      "bias": {
+        "dir": "DOWN",
+        "cont": 5,
+        "rev": 8,
+        "N": 13,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:20:23 | 1193.21 | DOWN [6]",
+      "price": 1193.21,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:20:23 | 1193.21 | DOWN [6]",
+      "confirmed_at_expected_tick": true,
+      "entry_tick": "17:20:24 | 1193.17 | DOWN [7]",
+      "entry_at_expected_tick": false,
+      "entry_ticks_after_expected": 1,
+      "entry_ticks_after_signal": 2
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": true
+    },
+    "outcome": {
+      "entry": 1193.17,
+      "exit": 1193.51,
+      "exit_minus_entry": 0.34,
+      "profit": 1.8
+    },
+    "tape": [
+      "17:20:18 | 1194.06 | DOWN [1]",
+      "17:20:19 | 1193.8 | DOWN [2]",
+      "17:20:20 | 1193.6 | DOWN [3]",
+      "17:20:21 | 1193.54 | DOWN [4]",
+      "17:20:22 | 1193.48 | DOWN [5]  <- SIGNAL",
+      "17:20:23 | 1193.21 | DOWN [6]  <- EXPECTED+CONFIRMED",
+      "17:20:24 | 1193.17 | DOWN [7]  <- ENTRY",
+      "17:20:25 | 1193.51 | UP [1]  <- EXIT"
+    ]
+  },
+  {
+    "logged_at": "2026-10-28T17:20:34+00:00",
+    "win_no": 37,
+    "on_win_streak": 2,
+    "contract_id": 18624059279,
+    "symbol": "1HZ100V",
+    "1_signal": {
+      "tick": "17:20:29 | 1194.54 | UP [5]",
+      "price": 1194.54,
+      "streak": "UP real 5 + assumed 1",
+      "order": "PUT stake 1.00 step 0 (direct)",
+      "bias": {
+        "dir": "UP",
+        "cont": 7,
+        "rev": 11,
+        "N": 18,
+        "seg": 3
+      }
+    },
+    "2_expected_tick": {
+      "tick": "17:20:30 | 1194.72 | UP [6]",
+      "price": 1194.72,
+      "matches_streak_dir": true
+    },
+    "3_execution": {
+      "confirmed_tick": "17:20:30 | 1194.72 | UP [6]",
+      "confirmed_at_expected_tick": true,
+      "entry_tick": "17:20:31 | 1194.96 | UP [7]",
+      "entry_at_expected_tick": false,
+      "entry_ticks_after_expected": 1,
+      "entry_ticks_after_signal": 2
+    },
+    "4_direction_check": {
+      "expected_tick_matched_streak": true,
+      "entry_tick_matched_streak": true,
+      "virtual_streak_held_until_entry": true
+    },
+    "outcome": {
+      "entry": 1194.96,
+      "exit": 1194.79,
+      "exit_minus_entry": -0.17,
+      "profit": 0.9
+    },
+    "tape": [
+      "17:20:25 | 1193.51 | UP [1]",
+      "17:20:26 | 1193.66 | UP [2]",
+      "17:20:27 | 1194.1 | UP [3]",
+      "17:20:28 | 1194.37 | UP [4]",
+      "17:20:29 | 1194.54 | UP [5]  <- SIGNAL",
+      "17:20:30 | 1194.72 | UP [6]  <- EXPECTED+CONFIRMED",
+      "17:20:31 | 1194.96 | UP [7]  <- ENTRY",
+      "17:20:32 | 1194.79 | DOWN [1]  <- EXIT"
+    ]
+  }
+]
+]

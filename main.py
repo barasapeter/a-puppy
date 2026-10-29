@@ -86,7 +86,7 @@ ACCOUNT_TYPE = "demo"
 SYMBOLS = ["1HZ100V"]
 CURRENCY = "USD"
 
-STREAK = 3  # target streak length (virtual, includes look-ahead ticks)
+STREAK = 6  # target streak length (virtual, includes look-ahead ticks)
 BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
 LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
@@ -95,11 +95,11 @@ MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
 MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
-MIN_EDGE = 0.10  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 60  # when decided samples in a direction reach this -> new segment
+SEGMENT_LIMIT = 30  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
@@ -406,7 +406,11 @@ class Bot:
         # ---- locate the real entry tick (epoch match, else price match) ----
         entry_t = None
         for t in st.tick_log:
-            if t["idx"] > sig_idx and entry_time is not None and t["epoch"] == entry_time:
+            if (
+                t["idx"] > sig_idx
+                and entry_time is not None
+                and t["epoch"] == entry_time
+            ):
                 entry_t = t
                 break
         if entry_t is None and entry_spot is not None:
@@ -422,7 +426,9 @@ class Bot:
                 if t["idx"] <= entry_t["idx"]:
                     continue
                 if (exit_time is not None and t["epoch"] == exit_time) or (
-                    exit_time is None and exit_spot is not None and t["price"] == exit_spot
+                    exit_time is None
+                    and exit_spot is not None
+                    and t["price"] == exit_spot
                 ):
                     exit_t = t
                     break
@@ -440,9 +446,7 @@ class Bot:
         entry_ok = None if entry_t is None else entry_t["dir"] == sdir
         virtual_held = None
         if entry_t is not None:
-            between = [
-                t for t in st.tick_log if sig_idx < t["idx"] <= entry_t["idx"]
-            ]
+            between = [t for t in st.tick_log if sig_idx < t["idx"] <= entry_t["idx"]]
             virtual_held = bool(between) and all(t["dir"] == sdir for t in between)
 
         # ---- tape: streak start -> exit, tagged ----
@@ -543,7 +547,12 @@ class Bot:
     def log_trade(self, order, poc, contract_id, status):
         """Never raises: logging must not disturb trading."""
         if status == "lost":
-            kind, enabled, path, count = "loss", LOSS_LOG_ENABLED, LOSS_LOG_FILE, self.losses
+            kind, enabled, path, count = (
+                "loss",
+                LOSS_LOG_ENABLED,
+                LOSS_LOG_FILE,
+                self.losses,
+            )
         elif status == "won":
             kind, enabled, path, count = "win", WIN_LOG_ENABLED, WIN_LOG_FILE, self.wins
         else:
