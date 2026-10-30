@@ -44,6 +44,18 @@ Key ideas
   loss, URSVD goes up by one, the circuit reopens, and nothing is written to
   the JSON logs.  A result that arrives afterwards is only reported.
 
+* [INVERTER] Automatic signal inversion.  Every resolved trade also gets a
+  VIRTUAL result: whether the ORIGINAL (un-inverted) signal would have won
+  (computed from entry/exit spots, so inverted trades are judged fairly).  When
+  no trade was ever inverted, the virtual win rate equals the actual win rate.
+  Over the last INVERT_WINDOW (10) resolved trades:
+      virtual win rate <  INVERT_BELOW (40%)        -> invert the next signals
+      virtual win rate >= REVERT_AT_OR_ABOVE (49%)  -> trade signals as fired again
+  (in between, the current mode is kept).  Inverted trades are tallied and shown
+  on every resolved-trade report, e.g. "Inverted: 5 trades | 3 won 2 lost".
+  Assumed losses count as virtual losses.  Bias stats keep measuring the market,
+  never the trades, so inversion does not feed back into the signal core.
+
 * [LOSSLOG] Every resolved contract is appended as a compact checkpoint report
   (signal tick, expected execution tick, confirmation / entry tick, direction
   checks, outcome, and a tick tape from the streak start to the exit).
@@ -120,6 +132,12 @@ ASSUME_LOSS_ON_TIMEOUT = True  # final fallback: count the contract as lost
 
 # [RECOVERY] size the post-win stake so the net P&L is forced positive
 RECOVERY_ENABLED = True
+
+# [INVERTER] automatic signal inversion
+INVERTER_ENABLED = True
+INVERT_WINDOW = 10  # last N resolved trades (virtual results) that are examined
+INVERT_BELOW = 0.40  # virtual win rate below this  -> invert the next signals
+REVERT_AT_OR_ABOVE = 0.49  # virtual win rate at/above this -> original signals again
 
 # [LOSSLOG]
 LOSS_LOG_ENABLED = False
@@ -225,6 +243,8 @@ class Order:
     query_attempts: int = 0  # [TIMEOUT] status queries sent
     query_failures: int = 0  # [TIMEOUT] queries that errored / unanswered / unsettled
     query_outstanding: bool = False  # [TIMEOUT] a query is awaiting its answer
+    original_type: str | None = None  # [INVERTER] signal as fired (before inversion)
+    inverted: bool = False  # [INVERTER] True if contract_type was flipped
 
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +279,12 @@ class Bot:
         self.target_hits = 0
         self.basket = 0.0
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
+
+        # [INVERTER] signal inversion state
+        self.inverting = False  # True -> next signals are flipped
+        self.virtual_window = deque(maxlen=INVERT_WINDOW)  # last virtual results
+        self.virtual_wins = self.virtual_losses = 0  # original-signal results
+        self.inv_trades = self.inv_wins = self.inv_losses = 0  # inverted trades only
 
     # ----------------------------------------------------------------- utils
     def trigger_count(self):
@@ -373,7 +399,7 @@ class Bot:
                 return t
         return None
 
-    def build_trade_record(self, order, poc, contract_id, kind):
+    def build_trade_record(self, order, poc, contract_id, kind, inv=None):
         """Compact checkpoint report for one resolved trade (kind: loss / win)."""
         st = self.symbols.get(order.symbol) if order is not None else None
         sig = order.signal if order is not None else None
@@ -388,9 +414,15 @@ class Bot:
             "contract_id": contract_id,
             "symbol": order.symbol if order is not None else None,
         }
+        inv_view = None
+        if inv is not None:  # [INVERTER]
+            inv_view = {k: inv[k] for k in ("inverted", "original_signal", "traded", "virtual_win")}
+
         if st is None or sig is None:
             base["note"] = "signal context unavailable (e.g. reconnect mid-trade)"
             base["outcome"] = self._outcome(poc)
+            if inv_view is not None:
+                base["inversion"] = inv_view
             return base
 
         sig_idx = sig["idx"]
@@ -502,6 +534,8 @@ class Bot:
             "virtual_streak_held_until_entry": virtual_held,
         }
         record["outcome"] = self._outcome(poc)
+        if inv_view is not None:  # [INVERTER]
+            record["inversion"] = inv_view
         record["tape"] = tape
         return record
 
@@ -540,7 +574,7 @@ class Bot:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
 
-    def log_trade(self, order, poc, contract_id, status):
+    def log_trade(self, order, poc, contract_id, status, inv=None):
         """Never raises: logging must not disturb trading."""
         if status == "lost":
             kind, enabled, path, count = "loss", LOSS_LOG_ENABLED, LOSS_LOG_FILE, self.losses
@@ -551,7 +585,7 @@ class Bot:
         if not enabled:
             return
         try:
-            record = self.build_trade_record(order, poc, contract_id, kind)
+            record = self.build_trade_record(order, poc, contract_id, kind, inv)
             self.save_record(record, path)
             print(f"[LOSSLOG] {kind} #{count} saved -> {path}")
         except Exception as error:
@@ -688,7 +722,18 @@ class Bot:
             elif self.busy:
                 note = " | [SKIP] contract still open"
             else:
+                # [INVERTER] flip the signal while the inverter is active
+                original_type = contract_type
+                inverted = INVERTER_ENABLED and self.inverting
+                if inverted:
+                    contract_type = "PUT" if contract_type == "CALL" else "CALL"
+
                 mode = await self.place_order(symbol, contract_type, st.tick_idx)
+
+                if self.order is not None:  # [INVERTER] remember what was fired
+                    self.order.original_type = original_type
+                    self.order.inverted = inverted
+                inv_tag = f" INVERTED from {original_type}" if inverted else ""
 
                 # [LOSSLOG] attach the signal snapshot AFTER the send
                 if LOSS_LOG_ENABLED and self.order is not None:
@@ -697,7 +742,7 @@ class Bot:
                     )
 
                 note = (
-                    f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
+                    f" | [ORDER {contract_type}{inv_tag}] stake {self.stake:.2f} {CURRENCY} | "
                     f"step {self.mg_step} | {mode} | {direction}-bias N={decided} | "
                     f"seg {st.segments[direction]}"  # [SEGMENT]
                 )
@@ -925,6 +970,9 @@ class Bot:
         if info:
             print(info)
 
+        # [INVERTER] an assumed loss is a virtual loss too
+        inv = self.inverter_result(order, "lost", None, assumed=True)
+
         decided = self.wins + self.losses
         win_rate = self.wins / decided * 100 if decided else 0
         target_status = (
@@ -947,6 +995,8 @@ class Bot:
             f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
         )
         print(f"   Segment: {self.segment_text(st)}")
+        for line in self.inverter_lines(inv):  # [INVERTER]
+            print(line)
         print("==========================================")
         print(f"   Min bankroll: {self.min_bankroll:.2f} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
@@ -969,6 +1019,119 @@ class Bot:
                 f"{str(poc.get('status')).upper()} {_to_float(poc.get('profit'))} USD "
                 f"(ignored: already counted as an assumed loss)"
             )
+
+    # [INVERTER] --------------------------------------------------------
+    @staticmethod
+    def _virtual_win_from_spots(original_type, poc):
+        """Would the ORIGINAL signal have won? None if the spots are unknown."""
+        poc = poc or {}
+        entry = _to_float(poc.get("entry_spot"))
+        exit_ = _to_float(poc.get("exit_spot"))
+        if entry is None or exit_ is None or original_type not in ("CALL", "PUT"):
+            return None
+        return exit_ > entry if original_type == "CALL" else exit_ < entry
+
+    def update_inverter_state(self):
+        """Decide whether the NEXT signals are inverted (hysteresis 40% / 49%)."""
+        if not INVERTER_ENABLED or len(self.virtual_window) < INVERT_WINDOW:
+            return
+        wins = sum(1 for w in self.virtual_window if w)
+        total = len(self.virtual_window)
+        rate = wins / total
+
+        if not self.inverting and rate < INVERT_BELOW:
+            self.inverting = True
+            print(
+                f"[INVERTER] ON  | virtual win rate over last {total}: "
+                f"{rate * 100:.0f}% ({wins}W {total - wins}L) < {INVERT_BELOW * 100:.0f}% "
+                f"-> next signals will be INVERTED"
+            )
+        elif self.inverting and rate >= REVERT_AT_OR_ABOVE:
+            self.inverting = False
+            print(
+                f"[INVERTER] OFF | virtual win rate over last {total}: "
+                f"{rate * 100:.0f}% ({wins}W {total - wins}L) >= "
+                f"{REVERT_AT_OR_ABOVE * 100:.0f}% -> next signals back AS FIRED"
+            )
+
+    def inverter_result(self, order, status, poc=None, assumed=False):
+        """
+        Record one resolved trade in the inverter statistics.
+        Returns a small dict describing the trade (None for non won/lost).
+        """
+        if status not in ("won", "lost"):
+            return None
+
+        actual_win = status == "won"
+        inverted = bool(order is not None and order.inverted)
+        traded = order.contract_type if order is not None else None
+        original = None
+        if order is not None:
+            original = order.original_type if inverted else order.contract_type
+
+        if inverted:
+            self.inv_trades += 1
+            if actual_win:
+                self.inv_wins += 1
+            else:
+                self.inv_losses += 1
+
+            if assumed:
+                virtual_win = False  # no data: an unresolved contract counts as lost
+            else:
+                virtual_win = self._virtual_win_from_spots(original, poc)
+                if virtual_win is None:  # spots missing: opposite of the real result
+                    virtual_win = not actual_win
+        else:
+            virtual_win = actual_win  # not inverted: virtual == actual
+
+        if virtual_win:
+            self.virtual_wins += 1
+        else:
+            self.virtual_losses += 1
+        self.virtual_window.append(virtual_win)
+        self.update_inverter_state()
+
+        if inverted:
+            text = f"INVERTED ({original} -> {traded})"
+        else:
+            text = f"AS FIRED ({traded})" if traded else "AS FIRED"
+        return {
+            "inverted": inverted,
+            "original_signal": original,
+            "traded": traded,
+            "virtual_win": virtual_win,
+            "text": text,
+        }
+
+    def inverter_lines(self, inv):
+        """Report lines: this trade's signal, virtual win rate, inverted tally."""
+        lines = []
+        if inv is not None:
+            lines.append(f"   Signal: {inv['text']}")
+
+        vtotal = self.virtual_wins + self.virtual_losses
+        vrate = self.virtual_wins / vtotal * 100 if vtotal else 0
+        same = "  (no trades inverted = actual)" if self.inv_trades == 0 else ""
+        lines.append(
+            f"   Virtual win rate: {vrate:.0f}% {self.virtual_wins}W "
+            f"{self.virtual_losses}L{same}"
+        )
+        lines.append(
+            f"   Inverted: {self.inv_trades} trades | "
+            f"{self.inv_wins} won {self.inv_losses} lost"
+        )
+
+        n = len(self.virtual_window)
+        w = sum(1 for x in self.virtual_window if x)
+        pct = w / n * 100 if n else 0
+        state = "ON" if self.inverting else "OFF"
+        if not INVERTER_ENABLED:
+            state = "DISABLED"
+        lines.append(
+            f"   Inverter: {state} | last {n} virtual: {w}W {n - w}L ({pct:.0f}%)"
+        )
+        return lines
 
     def update_min_bankroll(self):
         """[RECOVERY] Peak capital needed: amount lost so far + next stake."""
@@ -1076,6 +1239,13 @@ class Bot:
         if info:
             print(info)
 
+        # [INVERTER] virtual / inverted statistics for this resolved trade
+        inv = self.inverter_result(
+            order if order is not None and order.contract_id == contract_id else None,
+            status,
+            poc,
+        )
+
         # [LOSSLOG] losses -> loss file, wins -> win file; the order must be
         # the one that just resolved
         if status in ("lost", "won"):
@@ -1084,7 +1254,7 @@ class Bot:
                 if order is not None and order.contract_id == contract_id
                 else None
             )
-            self.log_trade(trade_order, poc, contract_id, status)
+            self.log_trade(trade_order, poc, contract_id, status, inv)
 
         # ---- report ----
         decided = self.wins + self.losses
@@ -1118,6 +1288,8 @@ class Bot:
             f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
         )
         print(f"   Segment: {seg_text}")  # [SEGMENT]
+        for line in self.inverter_lines(inv):  # [INVERTER]
+            print(line)
         print("==========================================")
         print(f"   Min bankroll: {min_bankroll:.2f} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
@@ -1227,6 +1399,11 @@ class Bot:
                     print(  # [LOSSLOG]
                         f"LOSS_LOG={LOSS_LOG_ENABLED} | LOSS_LOG_FILE={LOSS_LOG_FILE} | "
                         f"WIN_LOG={WIN_LOG_ENABLED} | WIN_LOG_FILE={WIN_LOG_FILE}"
+                    )
+                    print(  # [INVERTER]
+                        f"INVERTER={INVERTER_ENABLED} | WINDOW={INVERT_WINDOW} | "
+                        f"INVERT_BELOW={INVERT_BELOW} | "
+                        f"REVERT_AT_OR_ABOVE={REVERT_AT_OR_ABOVE}"
                     )
                     await self.on_connect()
                     delay = 2
