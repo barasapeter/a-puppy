@@ -67,6 +67,15 @@ Key ideas
                                   (outcome reversed for inverted trades)
       inverted / non-inverted   - actual outcomes split by inversion state
   The existing cumulative wins/losses and everything else are untouched.
+
+* [ROLLING] The virtual win rate that drives inversion is the ACTIVE virtual
+  win rate, chosen by VIRTUAL_WIN_RATE_MODE:
+      "WINDOW" - only the latest VIRTUAL_WIN_RATE_WINDOW resolved virtual
+                 outcomes (default 12); the oldest one drops out as soon as a
+                 new one arrives
+      "ALL"    - every resolved virtual outcome of the session
+  Lifetime virtual wins/losses are still kept (reporting only) and never drive
+  the inversion decision in WINDOW mode.
 """
 
 import asyncio
@@ -149,6 +158,11 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # [INVERT] adaptive signal inversion: ON when virtual win rate <= this (percent)
 INVERSION_THRESHOLD = 40.0
 
+# [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
+# calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
+VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
+VIRTUAL_WIN_RATE_WINDOW = 12  # N for WINDOW mode (positive integer)
+
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
@@ -208,6 +222,27 @@ def _rate_text(wins, losses):
     if not total:
         return f"n/a ({wins}W {losses}L)"
     return f"{wins / total * 100:.1f}% ({wins}W {losses}L)"
+
+
+# [ROLLING] configuration validation (fails loudly instead of miscalculating)
+def validate_virtual_rate_config():
+    if VIRTUAL_WIN_RATE_MODE not in ("WINDOW", "ALL"):
+        raise ValueError(
+            f"VIRTUAL_WIN_RATE_MODE must be 'WINDOW' or 'ALL', "
+            f"got {VIRTUAL_WIN_RATE_MODE!r}"
+        )
+    if VIRTUAL_WIN_RATE_MODE == "WINDOW" and (
+        isinstance(VIRTUAL_WIN_RATE_WINDOW, bool)
+        or not isinstance(VIRTUAL_WIN_RATE_WINDOW, int)
+        or VIRTUAL_WIN_RATE_WINDOW <= 0
+    ):
+        raise ValueError(
+            f"VIRTUAL_WIN_RATE_WINDOW must be a positive integer in WINDOW mode, "
+            f"got {VIRTUAL_WIN_RATE_WINDOW!r}"
+        )
+
+
+validate_virtual_rate_config()
 
 
 # --------------------------------------------------------------------------- #
@@ -298,7 +333,15 @@ class Bot:
         # [INVERT] independent inversion statistics
         self.trade_meta = {}  # contract_id -> {"original", "executed", "inverted"}
         self.real_wins = self.real_losses = 0  # actual execution outcomes
-        self.virtual_wins = self.virtual_losses = 0  # original-signal outcomes
+        self.virtual_wins = self.virtual_losses = 0  # LIFETIME original-signal outcomes
+        # [ROLLING] ordered virtual outcomes (True = virtual WIN) and the ACTIVE
+        # counters derived from them; the active counters drive inversion
+        self.virtual_history = deque(
+            maxlen=VIRTUAL_WIN_RATE_WINDOW
+            if VIRTUAL_WIN_RATE_MODE == "WINDOW"
+            else None
+        )
+        self.active_virtual_wins = self.active_virtual_losses = 0
         self.inv_wins = self.inv_losses = 0  # actual outcomes, inverted trades
         self.noninv_wins = self.noninv_losses = 0  # actual outcomes, non-inverted
 
@@ -341,10 +384,35 @@ class Bot:
         With no virtual trades yet there is no rate: inversion stays OFF.
         Integer cross-multiplication avoids float rounding at exactly 40%.
         """
-        total = self.virtual_wins + self.virtual_losses
+        # [ROLLING] uses the ACTIVE counters (window or all), never the lifetime ones
+        total = self.active_virtual_wins + self.active_virtual_losses
         if not total:
             return False
-        return self.virtual_wins * 100 <= INVERSION_THRESHOLD * total
+        return self.active_virtual_wins * 100 <= INVERSION_THRESHOLD * total
+
+    def record_virtual_outcome(self, virtual_win):
+        """
+        [ROLLING] Record ONE virtual outcome: lifetime counters always grow; the
+        ordered history / active counters keep only the latest N in WINDOW mode.
+        """
+        if virtual_win:
+            self.virtual_wins += 1
+        else:
+            self.virtual_losses += 1
+
+        history = self.virtual_history
+        if history.maxlen is not None and len(history) == history.maxlen:
+            oldest = history.popleft()  # leaves the window immediately
+            if oldest:
+                self.active_virtual_wins -= 1
+            else:
+                self.active_virtual_losses -= 1
+
+        history.append(bool(virtual_win))
+        if virtual_win:
+            self.active_virtual_wins += 1
+        else:
+            self.active_virtual_losses += 1
 
     def record_inversion_result(self, meta, status):
         """
@@ -368,10 +436,7 @@ class Bot:
         # trade is the original signal; an inverted trade is its opposite, so
         # the outcome is reversed.
         virtual_win = won != inverted
-        if virtual_win:
-            self.virtual_wins += 1
-        else:
-            self.virtual_losses += 1
+        self.record_virtual_outcome(virtual_win)  # [ROLLING]
 
         # inverted / non-inverted: actual outcomes
         if inverted:
@@ -402,13 +467,25 @@ class Bot:
         print(f"   Executed signal: {meta['executed']}")
         print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
         print(f"   Actual outcome: {outcome}")
-        print(f"   Real win rate: {_rate_text(self.real_wins, self.real_losses)}")
+        print(f"   Real Win Rate: {_rate_text(self.real_wins, self.real_losses)}")
+        samples = len(self.virtual_history)
+        if VIRTUAL_WIN_RATE_MODE == "WINDOW":
+            mode_text = (
+                f"Mode: WINDOW | Samples: {samples}/{VIRTUAL_WIN_RATE_WINDOW}"
+            )
+        else:
+            mode_text = f"Mode: ALL | Samples: {samples}"
         print(
-            f"   Virtual win rate: "
+            f"   Virtual Win Rate: "
+            f"{_rate_text(self.active_virtual_wins, self.active_virtual_losses)}"
+            f" | {mode_text}"
+        )
+        print(
+            f"   Lifetime Virtual Win Rate: "
             f"{_rate_text(self.virtual_wins, self.virtual_losses)}"
         )
-        print(f"   Inverted trades: {self.inv_wins}W {self.inv_losses}L")
-        print(f"   Non-inverted trades: {self.noninv_wins}W {self.noninv_losses}L")
+        print(f"   Inverted Trades: {self.inv_wins}W {self.inv_losses}L")
+        print(f"   Non-Inverted Trades: {self.noninv_wins}W {self.noninv_losses}L")
         print(f"   Cumulative: {self.wins}W {self.losses}L")
         print(
             f"   Inversion for next signal: {inv_state} "
@@ -1429,6 +1506,14 @@ class Bot:
                     print(  # [INVERT]
                         f"INVERSION_THRESHOLD={INVERSION_THRESHOLD:.0f}% "
                         f"(invert PUT/CALL when virtual win rate <= threshold)"
+                    )
+                    print(  # [ROLLING]
+                        f"VIRTUAL_WIN_RATE_MODE={VIRTUAL_WIN_RATE_MODE}"
+                        + (
+                            f" | VIRTUAL_WIN_RATE_WINDOW={VIRTUAL_WIN_RATE_WINDOW}"
+                            if VIRTUAL_WIN_RATE_MODE == "WINDOW"
+                            else ""
+                        )
                     )
                     await self.on_connect()
                     delay = 2
