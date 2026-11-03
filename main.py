@@ -156,12 +156,12 @@ WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [INVERT] adaptive signal inversion: ON when virtual win rate <= this (percent)
-INVERSION_THRESHOLD = 40.0
+INVERSION_THRESHOLD = 35.0
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
 VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
-VIRTUAL_WIN_RATE_WINDOW = 8  # N for WINDOW mode (positive integer)
+VIRTUAL_WIN_RATE_WINDOW = 15  # N for WINDOW mode (positive integer)
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
