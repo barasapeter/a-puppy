@@ -126,7 +126,7 @@ MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 20  # when decided samples in a direction reach this -> new segment
+SEGMENT_LIMIT = 40  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
@@ -156,12 +156,12 @@ WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [INVERT] adaptive signal inversion: ON when virtual win rate <= this (percent)
-INVERSION_THRESHOLD = 35.0
+INVERSION_THRESHOLD = 44.0
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
 VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
-VIRTUAL_WIN_RATE_WINDOW = 15  # N for WINDOW mode (positive integer)
+VIRTUAL_WIN_RATE_WINDOW = 18  # N for WINDOW mode (positive integer)
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
@@ -337,9 +337,9 @@ class Bot:
         # [ROLLING] ordered virtual outcomes (True = virtual WIN) and the ACTIVE
         # counters derived from them; the active counters drive inversion
         self.virtual_history = deque(
-            maxlen=VIRTUAL_WIN_RATE_WINDOW
-            if VIRTUAL_WIN_RATE_MODE == "WINDOW"
-            else None
+            maxlen=(
+                VIRTUAL_WIN_RATE_WINDOW if VIRTUAL_WIN_RATE_MODE == "WINDOW" else None
+            )
         )
         self.active_virtual_wins = self.active_virtual_losses = 0
         self.inv_wins = self.inv_losses = 0  # actual outcomes, inverted trades
@@ -470,9 +470,7 @@ class Bot:
         print(f"   Real Win Rate: {_rate_text(self.real_wins, self.real_losses)}")
         samples = len(self.virtual_history)
         if VIRTUAL_WIN_RATE_MODE == "WINDOW":
-            mode_text = (
-                f"Mode: WINDOW | Samples: {samples}/{VIRTUAL_WIN_RATE_WINDOW}"
-            )
+            mode_text = f"Mode: WINDOW | Samples: {samples}/{VIRTUAL_WIN_RATE_WINDOW}"
         else:
             mode_text = f"Mode: ALL | Samples: {samples}"
         print(
@@ -917,9 +915,7 @@ class Bot:
                 # [INVERT] decide with the virtual win rate available right now;
                 # SKIP never reaches this branch, so it can never be inverted.
                 original_signal = contract_type
-                inverted = (
-                    original_signal in INVERSE_SIGNAL and self.inversion_active()
-                )
+                inverted = original_signal in INVERSE_SIGNAL and self.inversion_active()
                 if inverted:
                     contract_type = INVERSE_SIGNAL[original_signal]
 
