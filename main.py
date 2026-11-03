@@ -49,6 +49,24 @@ Key ideas
   checks, outcome, and a tick tape from the streak start to the exit).
   LOST contracts go to LOSS_LOG_FILE, WON contracts to WIN_LOG_FILE (both JSON
   arrays).  Purely observational.
+
+* [INVERT] ADAPTIVE SIGNAL INVERSION: infer_market_bias still produces the
+  original signal (PUT / CALL / SKIP) exactly as before.  Just before a PUT or
+  CALL is sent, the bot looks at the VIRTUAL win rate (how the ORIGINAL signals
+  would have performed) and decides whether to flip the signal:
+
+      virtual win rate <= INVERSION_THRESHOLD (40%)  -> inversion ON  (PUT<->CALL)
+      virtual win rate  > INVERSION_THRESHOLD        -> inversion OFF
+      no virtual trades yet                          -> inversion OFF
+
+  SKIP is never inverted and never traded.  The inversion state is stored on
+  the order when it is created and never changes.  On resolution each trade
+  updates, exactly once:
+      real wins/losses          - what actually happened
+      virtual wins/losses       - what the original signal would have done
+                                  (outcome reversed for inverted trades)
+      inverted / non-inverted   - actual outcomes split by inversion state
+  The existing cumulative wins/losses and everything else are untouched.
 """
 
 import asyncio
@@ -106,7 +124,7 @@ SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
-BASE_STAKE = 2
+BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2.0
 MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
@@ -128,11 +146,17 @@ WIN_LOG_ENABLED = False
 WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
+# [INVERT] adaptive signal inversion: ON when virtual win rate <= this (percent)
+INVERSION_THRESHOLD = 40.0
+
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
 DIRECTIONS = ("UP", "DOWN")
+
+# [INVERT] PUT <-> CALL (SKIP is never inverted)
+INVERSE_SIGNAL = {"PUT": "CALL", "CALL": "PUT"}
 
 
 def timestamp(epoch):
@@ -177,6 +201,15 @@ def _fmt_tick(t):
     return f"{timestamp(t['epoch'])} | {t['price']} | {t['dir']} [{t['cnt']}]"
 
 
+# [INVERT] helpers
+def _rate_text(wins, losses):
+    """'55.6% (5W 4L)' or 'n/a (0W 0L)' when nothing has been counted yet."""
+    total = wins + losses
+    if not total:
+        return f"n/a ({wins}W {losses}L)"
+    return f"{wins / total * 100:.1f}% ({wins}W {losses}L)"
+
+
 # --------------------------------------------------------------------------- #
 # State containers
 # --------------------------------------------------------------------------- #
@@ -216,7 +249,7 @@ class SymbolState:
 @dataclass(slots=True)
 class Order:
     symbol: str
-    contract_type: str
+    contract_type: str  # the signal actually executed
     signal_idx: int
     t_sent: float
     contract_id: int | None = None
@@ -225,6 +258,8 @@ class Order:
     query_attempts: int = 0  # [TIMEOUT] status queries sent
     query_failures: int = 0  # [TIMEOUT] queries that errored / unanswered / unsettled
     query_outstanding: bool = False  # [TIMEOUT] a query is awaiting its answer
+    original_signal: str | None = None  # [INVERT] signal returned by infer_market_bias
+    inverted: bool = False  # [INVERT] fixed at creation, never changed afterwards
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +295,13 @@ class Bot:
         self.basket = 0.0
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
 
+        # [INVERT] independent inversion statistics
+        self.trade_meta = {}  # contract_id -> {"original", "executed", "inverted"}
+        self.real_wins = self.real_losses = 0  # actual execution outcomes
+        self.virtual_wins = self.virtual_losses = 0  # original-signal outcomes
+        self.inv_wins = self.inv_losses = 0  # actual outcomes, inverted trades
+        self.noninv_wins = self.noninv_losses = 0  # actual outcomes, non-inverted
+
     # ----------------------------------------------------------------- utils
     def trigger_count(self):
         return max(1, STREAK - self.lookahead)
@@ -290,6 +332,89 @@ class Bot:
             return None
         parts = [cls._bucket_text(d, stats[d]) for d in DIRECTIONS]
         return f"SESSION BIAS | {symbol} | " + "  ||  ".join(parts)
+
+    # [INVERT] ----------------------------------------------------------
+    def inversion_active(self):
+        """
+        Inversion decision, based EXCLUSIVELY on the virtual win rate:
+        ON when virtual win rate <= INVERSION_THRESHOLD (inclusive), OFF above.
+        With no virtual trades yet there is no rate: inversion stays OFF.
+        Integer cross-multiplication avoids float rounding at exactly 40%.
+        """
+        total = self.virtual_wins + self.virtual_losses
+        if not total:
+            return False
+        return self.virtual_wins * 100 <= INVERSION_THRESHOLD * total
+
+    def record_inversion_result(self, meta, status):
+        """
+        Update real / virtual / inverted / non-inverted counters for ONE
+        resolved trade.  Callers guarantee a single call per contract (the
+        `resolved` set guards the normal path, assume_loss marks the contract
+        resolved first).
+        """
+        if status not in ("won", "lost") or meta is None:
+            return
+        won = status == "won"
+        inverted = meta["inverted"]
+
+        # real: what actually happened
+        if won:
+            self.real_wins += 1
+        else:
+            self.real_losses += 1
+
+        # virtual: what the ORIGINAL signal would have done.  A non-inverted
+        # trade is the original signal; an inverted trade is its opposite, so
+        # the outcome is reversed.
+        virtual_win = won != inverted
+        if virtual_win:
+            self.virtual_wins += 1
+        else:
+            self.virtual_losses += 1
+
+        # inverted / non-inverted: actual outcomes
+        if inverted:
+            if won:
+                self.inv_wins += 1
+            else:
+                self.inv_losses += 1
+        else:
+            if won:
+                self.noninv_wins += 1
+            else:
+                self.noninv_losses += 1
+
+    def inversion_report(self, meta, status, contract_id):
+        """Report lines, built AFTER the counters include the current trade."""
+        if status not in ("won", "lost"):
+            return
+        if meta is None:
+            print(
+                f"[INVERT] no inversion metadata for contract {contract_id}: "
+                f"not counted in inversion statistics"
+            )
+            return
+        outcome = "WIN" if status == "won" else "LOSS"
+        inv_state = "ON" if self.inversion_active() else "OFF"
+        print("   ---------------- ADAPTIVE INVERSION ----------------")
+        print(f"   Original signal: {meta['original']}")
+        print(f"   Executed signal: {meta['executed']}")
+        print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
+        print(f"   Actual outcome: {outcome}")
+        print(f"   Real win rate: {_rate_text(self.real_wins, self.real_losses)}")
+        print(
+            f"   Virtual win rate: "
+            f"{_rate_text(self.virtual_wins, self.virtual_losses)}"
+        )
+        print(f"   Inverted trades: {self.inv_wins}W {self.inv_losses}L")
+        print(f"   Non-inverted trades: {self.noninv_wins}W {self.noninv_losses}L")
+        print(f"   Cumulative: {self.wins}W {self.losses}L")
+        print(
+            f"   Inversion for next signal: {inv_state} "
+            f"(threshold <= {INVERSION_THRESHOLD:.0f}%)"
+        )
+        print("   ----------------------------------------------------")
 
     # [SEGMENT] ---------------------------------------------------------
     @staticmethod
@@ -340,7 +465,17 @@ class Bot:
         )
 
     # [LOSSLOG] ---------------------------------------------------------
-    def build_signal_info(self, st, direction, contract_type, mode, look, decided):
+    def build_signal_info(
+        self,
+        st,
+        direction,
+        contract_type,
+        mode,
+        look,
+        decided,
+        original_signal=None,
+        inverted=False,
+    ):
         """Light snapshot of the signal tick. Called AFTER the order is sent."""
         try:
             bucket = st.stats[direction]
@@ -351,6 +486,8 @@ class Bot:
                 "real_streak": st.count,
                 "assumed": look,
                 "contract": contract_type,
+                "original_signal": original_signal,  # [INVERT]
+                "inverted": inverted,  # [INVERT]
                 "stake": self.stake,
                 "step": self.mg_step,
                 "mode": mode,
@@ -477,6 +614,9 @@ class Bot:
             "price": sig_t["price"] if sig_t else None,
             "streak": f"{sdir} real {sig['real_streak']} + assumed {look}",
             "order": f"{sig['contract']} stake {sig['stake']:.2f} step {sig['step']} ({sig['mode']})",
+            "original_signal": sig.get("original_signal"),  # [INVERT]
+            "executed_signal": sig["contract"],  # [INVERT]
+            "inverted": "YES" if sig.get("inverted") else "NO",  # [INVERT]
             "bias": sig["bias"],
         }
         record["2_expected_tick"] = {
@@ -697,18 +837,37 @@ class Bot:
             elif self.busy:
                 note = " | [SKIP] contract still open"
             else:
-                mode = await self.place_order(symbol, contract_type, st.tick_idx)
+                # [INVERT] decide with the virtual win rate available right now;
+                # SKIP never reaches this branch, so it can never be inverted.
+                original_signal = contract_type
+                inverted = (
+                    original_signal in INVERSE_SIGNAL and self.inversion_active()
+                )
+                if inverted:
+                    contract_type = INVERSE_SIGNAL[original_signal]
+
+                mode = await self.place_order(
+                    symbol, contract_type, st.tick_idx, original_signal, inverted
+                )
 
                 # [LOSSLOG] attach the signal snapshot AFTER the send
                 if LOSS_LOG_ENABLED and self.order is not None:
                     self.order.signal = self.build_signal_info(
-                        st, direction, contract_type, mode, look, decided
+                        st,
+                        direction,
+                        contract_type,
+                        mode,
+                        look,
+                        decided,
+                        original_signal,
+                        inverted,
                     )
 
                 note = (
                     f" | [ORDER {contract_type}] stake {self.stake:.2f} {CURRENCY} | "
                     f"step {self.mg_step} | {mode} | {direction}-bias N={decided} | "
                     f"seg {st.segments[direction]}"  # [SEGMENT]
+                    f" | orig {original_signal} inv {'YES' if inverted else 'NO'}"  # [INVERT]
                 )
 
             note = (
@@ -725,7 +884,9 @@ class Bot:
             print("\n".join(logs))
 
     # --------------------------------------------------------------- orders
-    async def place_order(self, symbol, contract_type, signal_idx):
+    async def place_order(
+        self, symbol, contract_type, signal_idx, original_signal=None, inverted=False
+    ):
         stake = self.stake
         prop = self.proposals.get((symbol, contract_type)) if USE_PROPOSALS else None
 
@@ -752,6 +913,11 @@ class Bot:
         # Flag first, send second: no window for a duplicate order.
         self.busy = True
         self.order = Order(symbol, contract_type, signal_idx, time.monotonic())
+        # [INVERT] stored explicitly at creation; never derived from the outcome
+        self.order.original_signal = (
+            original_signal if original_signal is not None else contract_type
+        )
+        self.order.inverted = bool(inverted)
         await self.send(payload)
         return mode
 
@@ -808,6 +974,14 @@ class Bot:
             return
 
         order.contract_id = int(contract_id)
+
+        # [INVERT] keep the inversion record tied to the contract until it resolves
+        self.trade_meta[order.contract_id] = {
+            "original": order.original_signal,
+            "executed": order.contract_type,
+            "inverted": order.inverted,
+        }
+
         rtt = (time.monotonic() - order.t_sent) * 1000
         balance = info.get("balance_after")
         balance_text = f"{float(balance):.2f} USD" if balance is not None else "n/a"
@@ -926,6 +1100,11 @@ class Bot:
         self.unresolved += 1
         self.update_min_bankroll()
 
+        # [INVERT] an assumed loss is treated as a loss everywhere else, so it
+        # is counted once here too (the late result is ignored by on_late_poc)
+        meta = self.trade_meta.pop(contract_id, None)
+        self.record_inversion_result(meta, "lost")
+
         print(
             f"\n[!] ASSUMED LOSS | Contract {contract_id} still unresolved "
             f"{waited} ticks after confirmation | "
@@ -959,7 +1138,9 @@ class Bot:
         print("==========================================")
         print(f"   Min bankroll: {self.min_bankroll:.2f} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
-        print("==========================================\n")
+        print("==========================================")
+        self.inversion_report(meta, "lost", contract_id)  # [INVERT]
+        print()
 
         self.release()
 
@@ -1082,6 +1263,12 @@ class Bot:
         old_stake = self.stake
         info = self.apply_result(status, profit)
         self.update_min_bankroll()  # [RECOVERY]
+
+        # [INVERT] update real / virtual / inverted / non-inverted counters once.
+        # The contract is already in `resolved`, so a repeated event never gets here.
+        meta = self.trade_meta.pop(contract_id, None)
+        self.record_inversion_result(meta, status)
+
         if info:
             print(info)
 
@@ -1130,7 +1317,9 @@ class Bot:
         print("==========================================")
         print(f"   Min bankroll: {min_bankroll:.2f} USD ")
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
-        print("==========================================\n")
+        print("==========================================")
+        self.inversion_report(meta, status, contract_id)  # [INVERT]
+        print()
 
         if self.net_pl >= TARGET_PL:
             self.basket += self.net_pl
@@ -1236,6 +1425,10 @@ class Bot:
                     print(  # [LOSSLOG]
                         f"LOSS_LOG={LOSS_LOG_ENABLED} | LOSS_LOG_FILE={LOSS_LOG_FILE} | "
                         f"WIN_LOG={WIN_LOG_ENABLED} | WIN_LOG_FILE={WIN_LOG_FILE}"
+                    )
+                    print(  # [INVERT]
+                        f"INVERSION_THRESHOLD={INVERSION_THRESHOLD:.0f}% "
+                        f"(invert PUT/CALL when virtual win rate <= threshold)"
                     )
                     await self.on_connect()
                     delay = 2
