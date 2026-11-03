@@ -161,7 +161,7 @@ INVERSION_THRESHOLD = 40.0
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
 VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
-VIRTUAL_WIN_RATE_WINDOW = 12  # N for WINDOW mode (positive integer)
+VIRTUAL_WIN_RATE_WINDOW = 8  # N for WINDOW mode (positive integer)
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
@@ -577,7 +577,7 @@ class Bot:
                 },
             }
         except Exception:
-            traceback.print_exc()
+            # # traceback.print_exc()
             return None
 
     @staticmethod
@@ -781,8 +781,8 @@ class Bot:
             self.save_record(record, path)
             print(f"[LOSSLOG] {kind} #{count} saved -> {path}")
         except Exception as error:
-            traceback.print_exc()
-            print(f"[LOSSLOG] failed to save {kind} record: {error}")
+            # traceback.print_exc()
+            print(f"[LOSSLOG] failed to save {kind} record: {str(error)}")
 
     # ------------------------------------------------------------ tick logic
     def update_windows(self, st, symbol, price, epoch, logs):
@@ -1528,8 +1528,8 @@ class Bot:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                traceback.print_exc()
-                print(f"Connection error occurred: {error}")
+                # # traceback.print_exc()
+                print(f"Connection error occurred: {str(error)}")
 
             self.reconnects += 1
             print(f"Reconnecting in {delay} seconds...")
