@@ -108,7 +108,12 @@ Key ideas
   an inverted loss lowers it), which just alternates sides in a choppy market.
   Once the consecutive real-loss streak reaches LOSS_STREAK_BRAKE_AFTER:
       "HOLD" - the inversion mode of the last resolved trade is kept instead of
-               being re-decided from virtual win rate vs threshold
+               being re-decided, BUT ONLY while the evidence is ambiguous, i.e.
+               the virtual win rate is within LOSS_STREAK_BRAKE_HOLD_MARGIN
+               points of the active threshold.  A decisive virtual win rate
+               (further away than the margin) always goes through the normal
+               threshold rule, so the brake can never pin the bot to a mode
+               that the virtual win rate clearly says is losing.
       "SKIP" - the next LOSS_STREAK_BRAKE_SKIP_SIGNALS signals are skipped, then
                one trade is allowed again (and the skip counter re-arms while
                the streak continues)
@@ -163,7 +168,7 @@ MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 40  # when decided samples in a direction reach this -> new segment
+SEGMENT_LIMIT = 30  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
@@ -199,16 +204,19 @@ INVERSION_THRESHOLD = 44.0
 
 # [THRESHOLD] progressive, reversible adjustment of the active threshold
 #   delta(n) = THRESHOLD_ADJUSTMENT_BASE + (n - 1) * THRESHOLD_ADJUSTMENT_ACCELERATION
-THRESHOLD_ADJUSTMENT_BASE = 0.5  # adjustment of the 1st consecutive real loss
-THRESHOLD_ADJUSTMENT_ACCELERATION = 0.05  # extra adjustment per further loss
+THRESHOLD_ADJUSTMENT_BASE = 1.0  # adjustment of the 1st consecutive real loss
+THRESHOLD_ADJUSTMENT_ACCELERATION = 0.25  # extra adjustment per further loss
 THRESHOLD_MIN = 0.0  # the active threshold never goes below this
 THRESHOLD_MAX = 100.0  # the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 
 # [BRAKE] loss-streak brake (stops the normal <-> inverted flip-flop in a streak)
-LOSS_STREAK_BRAKE_ENABLED = True
-LOSS_STREAK_BRAKE_AFTER = 3  # consecutive real losses before the brake engages
+LOSS_STREAK_BRAKE_ENABLED = False
+LOSS_STREAK_BRAKE_AFTER = 7  # consecutive real losses before the brake engages
 LOSS_STREAK_BRAKE_ACTION = "HOLD"  # "HOLD" = keep last mode, "SKIP" = skip signals
+# HOLD only applies while |virtual win rate - active threshold| <= this many
+# percentage points (ambiguous zone); beyond it the threshold rule decides.
+LOSS_STREAK_BRAKE_HOLD_MARGIN = 3.0
 LOSS_STREAK_BRAKE_SKIP_SIGNALS = 3  # signals skipped per cycle in SKIP mode
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
@@ -367,6 +375,15 @@ def validate_brake_config():
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if (
+        isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, bool)
+        or not isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, (int, float))
+        or LOSS_STREAK_BRAKE_HOLD_MARGIN < 0
+    ):
+        raise ValueError(
+            f"LOSS_STREAK_BRAKE_HOLD_MARGIN must be a number >= 0, "
+            f"got {LOSS_STREAK_BRAKE_HOLD_MARGIN!r}"
+        )
 
 
 validate_brake_config()
@@ -540,16 +557,39 @@ class Bot:
             and self.threshold_loss_streak >= LOSS_STREAK_BRAKE_AFTER
         )
 
-    def decide_inversion(self):
+    def virtual_rate_pct(self):
+        """Active virtual win rate in percent, or None with no samples."""
+        total = self.active_virtual_wins + self.active_virtual_losses
+        if not total:
+            return None
+        return self.active_virtual_wins * 100 / total
+
+    def brake_holds(self):
         """
-        Inversion state for the next order.  Normally the threshold rule; while
-        the brake is engaged in HOLD mode the last trade's mode is kept.
+        True when the HOLD brake overrides the threshold rule: brake engaged,
+        HOLD action, a previous mode exists, and the virtual win rate lies
+        inside the ambiguous zone around the active threshold.
         """
         if (
-            self.brake_active()
-            and LOSS_STREAK_BRAKE_ACTION == "HOLD"
-            and self.last_trade_inverted is not None
+            not self.brake_active()
+            or LOSS_STREAK_BRAKE_ACTION != "HOLD"
+            or self.last_trade_inverted is None
         ):
+            return False
+        rate = self.virtual_rate_pct()
+        if rate is None:
+            return False
+        return (
+            round(abs(rate - self.active_threshold), 6) <= LOSS_STREAK_BRAKE_HOLD_MARGIN
+        )
+
+    def decide_inversion(self):
+        """
+        Inversion state for the next order.  The threshold rule decides, except
+        while the HOLD brake is engaged AND the evidence is ambiguous: then the
+        last trade's mode is kept.
+        """
+        if self.brake_holds():
             return self.last_trade_inverted
         return self.inversion_active()
 
@@ -570,8 +610,21 @@ class Bot:
         if not self.brake_active():
             return f"inactive (engages at {LOSS_STREAK_BRAKE_AFTER} consecutive losses)"
         if LOSS_STREAK_BRAKE_ACTION == "HOLD":
-            mode = "INVERTED" if self.last_trade_inverted else "NORMAL"
-            return f"ACTIVE (HOLD: next trade keeps {mode} mode)"
+            rate = self.virtual_rate_pct()
+            if self.brake_holds():
+                mode = "INVERTED" if self.last_trade_inverted else "NORMAL"
+                return (
+                    f"ACTIVE (HOLD: virtual {rate:.1f}% is within "
+                    f"{LOSS_STREAK_BRAKE_HOLD_MARGIN:g} pts of threshold, "
+                    f"next trade keeps {mode} mode)"
+                )
+            if rate is None:
+                return "ACTIVE (HOLD: no virtual samples, threshold rule decides)"
+            return (
+                f"ACTIVE (HOLD standing down: virtual {rate:.1f}% is "
+                f"{abs(rate - self.active_threshold):.1f} pts from threshold, "
+                f"> {LOSS_STREAK_BRAKE_HOLD_MARGIN:g}; threshold rule decides)"
+            )
         return f"ACTIVE (SKIP: {self.brake_skips_left} signal(s) left to skip)"
 
     def record_virtual_outcome(self, virtual_win):
@@ -788,6 +841,14 @@ class Bot:
             return
         outcome = "WIN" if status == "won" else "LOSS"
         inv_state = "ON" if self.decide_inversion() else "OFF"  # [BRAKE]
+        rule_state = "ON" if self.inversion_active() else "OFF"
+        if self.brake_holds():
+            inv_reason = (
+                f"held by brake; threshold rule says {rule_state} "
+                f"at <= {_pct_text(self.active_threshold)}"
+            )
+        else:
+            inv_reason = f"threshold <= {_pct_text(self.active_threshold)}"
         print("   ---------------- ADAPTIVE INVERSION ----------------")
         print(f"   Original signal: {meta['original']}")
         print(f"   Executed signal: {meta['executed']}")
@@ -818,10 +879,7 @@ class Bot:
         print(f"   Outstanding Adjustments: {len(self.threshold_stack)}")
         print(f"   Last Adjustment: {self.threshold_change_text()}")
         print(f"   Loss-Streak Brake: {self.brake_text()}")  # [BRAKE]
-        print(
-            f"   Inversion for next signal: {inv_state} "
-            f"(threshold <= {_pct_text(self.active_threshold)})"
-        )
+        print(f"   Inversion for next signal: {inv_state} " f"({inv_reason})")
         print("   ----------------------------------------------------")
 
     # [SEGMENT] ---------------------------------------------------------
@@ -1856,6 +1914,7 @@ class Bot:
                         f"LOSS_STREAK_BRAKE={LOSS_STREAK_BRAKE_ENABLED} | "
                         f"AFTER={LOSS_STREAK_BRAKE_AFTER} | "
                         f"ACTION={LOSS_STREAK_BRAKE_ACTION} | "
+                        f"HOLD_MARGIN={LOSS_STREAK_BRAKE_HOLD_MARGIN:g} | "
                         f"SKIP_SIGNALS={LOSS_STREAK_BRAKE_SKIP_SIGNALS}"
                     )
                     print(  # [ROLLING]
