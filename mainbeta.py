@@ -163,20 +163,20 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 5  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 30  # when decided samples in a direction reach this -> new segment
-SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
+SEGMENT_LIMIT = 500  # when decided samples in a direction reach this -> new segment
+SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1
-MARTINGALE_MULTIPLIER = 2.0
+MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 100
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
@@ -205,7 +205,7 @@ INVERSION_THRESHOLD = 44.0
 # [THRESHOLD] progressive, reversible adjustment of the active threshold
 #   delta(n) = THRESHOLD_ADJUSTMENT_BASE + (n - 1) * THRESHOLD_ADJUSTMENT_ACCELERATION
 THRESHOLD_ADJUSTMENT_BASE = 1.0  # adjustment of the 1st consecutive real loss
-THRESHOLD_ADJUSTMENT_ACCELERATION = 0.25  # extra adjustment per further loss
+THRESHOLD_ADJUSTMENT_ACCELERATION = 0.35  # extra adjustment per further loss
 THRESHOLD_MIN = 0.0  # the active threshold never goes below this
 THRESHOLD_MAX = 100.0  # the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
@@ -1367,7 +1367,7 @@ class Bot:
                 "buy": "1",
                 "price": stake,
                 "parameters": {
-                    "amount": stake,
+                    "amount": round(stake, 2),
                     "basis": "stake",
                     "contract_type": contract_type,
                     "currency": CURRENCY,
