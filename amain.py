@@ -130,7 +130,7 @@ SEGMENT_LIMIT = 60  # when decided samples in a direction reach this -> new segm
 SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
-USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
+USE_PROPOSALS = True  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1
