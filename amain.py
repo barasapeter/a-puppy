@@ -121,13 +121,13 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 20  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 40  # when decided samples in a direction reach this -> new segment
-SEGMENT_KEEP = 10  # latest decided samples carried over into the new segment
+SEGMENT_LIMIT = 60  # when decided samples in a direction reach this -> new segment
+SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
@@ -161,7 +161,7 @@ INVERSION_THRESHOLD = 44.0
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
 VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
-VIRTUAL_WIN_RATE_WINDOW = 18  # N for WINDOW mode (positive integer)
+VIRTUAL_WIN_RATE_WINDOW = 19  # N for WINDOW mode (positive integer)
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
