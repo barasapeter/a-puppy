@@ -163,12 +163,12 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 5  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 20  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 500  # when decided samples in a direction reach this -> new segment
+SEGMENT_LIMIT = 50  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
@@ -177,7 +177,7 @@ PRINT_TICKS = True
 
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
-MAX_MARTINGALE_STEPS = 100
+MAX_MARTINGALE_STEPS = 8
 MAX_STAKE = 4500.0
 TARGET_PL = 15.0
 
@@ -200,14 +200,14 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # [INVERT] adaptive signal inversion: ON when virtual win rate <= threshold
 # (percent).  This is the permanent BASELINE; the threshold actually used is
 # the ACTIVE threshold, adjusted by the [THRESHOLD] detector below.
-INVERSION_THRESHOLD = 44.0
+INVERSION_THRESHOLD = 46.0
 
 # [THRESHOLD] progressive, reversible adjustment of the active threshold
 #   delta(n) = THRESHOLD_ADJUSTMENT_BASE + (n - 1) * THRESHOLD_ADJUSTMENT_ACCELERATION
 THRESHOLD_ADJUSTMENT_BASE = 1.0  # adjustment of the 1st consecutive real loss
 THRESHOLD_ADJUSTMENT_ACCELERATION = 0.35  # extra adjustment per further loss
 THRESHOLD_MIN = 0.0  # the active threshold never goes below this
-THRESHOLD_MAX = 100.0  # the active threshold never goes above this
+THRESHOLD_MAX = 53.0  # the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 
 # [BRAKE] loss-streak brake (stops the normal <-> inverted flip-flop in a streak)
