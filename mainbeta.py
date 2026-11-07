@@ -206,7 +206,7 @@ INVERSION_THRESHOLD = 46.0
 #   delta(n) = THRESHOLD_ADJUSTMENT_BASE + (n - 1) * THRESHOLD_ADJUSTMENT_ACCELERATION
 THRESHOLD_ADJUSTMENT_BASE = 2.0  # adjustment of the 1st consecutive real loss
 THRESHOLD_ADJUSTMENT_ACCELERATION = 0.5  # extra adjustment per further loss
-THRESHOLD_MIN = 0.0  # the active threshold never goes below this
+THRESHOLD_MIN = 27.0  # the active threshold never goes below this
 THRESHOLD_MAX = 53.0  # the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 
