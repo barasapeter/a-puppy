@@ -172,7 +172,7 @@ SEGMENT_LIMIT = 50  # when decided samples in a direction reach this -> new segm
 SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
-USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
+USE_PROPOSALS = True  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1
@@ -221,7 +221,7 @@ LOSS_STREAK_BRAKE_SKIP_SIGNALS = 3  # signals skipped per cycle in SKIP mode
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
-VIRTUAL_WIN_RATE_MODE = "WINDOW"  # "WINDOW" or "ALL"
+VIRTUAL_WIN_RATE_MODE = "ALL"  # "WINDOW" or "ALL"
 VIRTUAL_WIN_RATE_WINDOW = 18  # N for WINDOW mode (positive integer)
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
