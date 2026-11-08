@@ -236,7 +236,7 @@ THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 # [MINTRADES] inversion warm-up: until this many trades are definitively
 # resolved, every signal executes normally (no inversion of any kind, and no
 # watchdog override).  0 disables the warm-up.
-INVERSION_MIN_RESOLVED_TRADES = 4
+INVERSION_MIN_RESOLVED_TRADES = 2
 
 # [WATCHDOG] Flip Flop Devil watchdog (replaces the old loss-streak brake)
 FLIP_FLOP_DEVIL_ENABLED = True
