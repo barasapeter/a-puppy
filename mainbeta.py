@@ -200,7 +200,7 @@ SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
-PRINT_TICKS = True
+PRINT_TICKS = False
 
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
