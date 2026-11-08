@@ -121,14 +121,18 @@ Key ideas
   it never touches the signal, the threshold, the virtual statistics, the
   martingale, the P&L or the orders' count.  Three levels:
 
-      LEVEL 1  |virtual win rate - active threshold| <= FLIP_FLOP_DEVIL_MARGIN
-               (preliminary warning only; no override of any kind)
-      LEVEL 2  Level 1 active AND the last three REAL resolved trades are all
-               losses AND their stored `inverted` flags alternate perfectly
-               (NO,YES,NO or YES,NO,YES) AND the normal engine wants the next
-               trade to continue the alternation.  A rescue basket is created
-               and the next trade is executed with the OPPOSITE of the
-               inversion the normal engine asked for.
+      LEVEL 1  MARGIN FLAG (informational ONLY): |virtual win rate - active
+               threshold| is reported as SMALL (<= FLIP_FLOP_DEVIL_MARGIN) or
+               LARGE, together with the exact number of points.  It never gates,
+               arms, delays or clears anything: the sequence below has priority.
+      LEVEL 2  EARLY SEQUENCE DETECTION (look back one step, look forward one):
+               the last TWO real resolved trades are both losses AND their
+               stored `inverted` flags differ (e.g. YES,NO) AND the normal engine
+               now requests the flag of the trade two steps back (YES), i.e. the
+               full pattern YES,NO,YES (or NO,YES,NO) would emerge.  Older trades
+               are irrelevant (YES,YES,[YES,NO],YES triggers).  A rescue basket
+               is created and the next trade is executed with the OPPOSITE of
+               the inversion the normal engine asked for.
       LEVEL 3  After a rescued trade resolves, the normal engine (re-evaluated
                on the updated statistics) still asks for the mode the watchdog
                suppressed -> the intervention is verified.
@@ -236,11 +240,11 @@ THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 # [MINTRADES] inversion warm-up: until this many trades are definitively
 # resolved, every signal executes normally (no inversion of any kind, and no
 # watchdog override).  0 disables the warm-up.
-INVERSION_MIN_RESOLVED_TRADES = 2
+INVERSION_MIN_RESOLVED_TRADES = 4
 
 # [WATCHDOG] Flip Flop Devil watchdog (replaces the old loss-streak brake)
 FLIP_FLOP_DEVIL_ENABLED = True
-FLIP_FLOP_DEVIL_MARGIN = 3.0  # Level 1: max |virtual win rate - active threshold| (pts)
+FLIP_FLOP_DEVIL_MARGIN = 3.0  # Level 1 flag only: SMALL if |virtual win rate - threshold| <= this (pts); never gates
 FLIP_FLOP_DEVIL_LOG_ENABLED = True
 FLIP_FLOP_DEVIL_LOG_FILE = "flip_flop_devil_events.json"  # JSON array of events
 
@@ -949,7 +953,12 @@ class Bot:
         rate = self.virtual_rate_pct()
         threshold = self.active_threshold
         if rate is None:  # no virtual samples: Level 1 cannot be confirmed
-            return {"active": False, "rate": None, "threshold": threshold, "margin": None}
+            return {
+                "active": False,
+                "rate": None,
+                "threshold": threshold,
+                "margin": None,
+            }
         margin = round(abs(rate - threshold), 6)
         return {
             "active": margin <= FLIP_FLOP_DEVIL_MARGIN,
@@ -969,23 +978,15 @@ class Bot:
             f"{'n/a' if status['margin'] is None else format(status['margin'], '.2f')} "
             f"pts (limit {FLIP_FLOP_DEVIL_MARGIN:g})"
         )
-        if status["active"] and not previous:
+        if status["active"] != previous:
+            word = "SMALL" if status["active"] else "LARGE"
             self.ffd_emit(
-                [f"[FLIP FLOP DEVIL] LEVEL 1 DETECTED ({context}) | margin WITHIN range | {detail}"],
+                [
+                    f"[FLIP FLOP DEVIL] LEVEL 1 MARGIN FLAG: {word} ({context}) | "
+                    f"informational only, does not gate the sequence watch | {detail}"
+                ],
                 {
-                    "event": "LEVEL_1_DETECTED",
-                    "context": context,
-                    "virtual_win_rate": status["rate"],
-                    "active_threshold": status["threshold"],
-                    "margin": status["margin"],
-                    "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
-                },
-            )
-        elif previous and not status["active"]:
-            self.ffd_emit(
-                [f"[FLIP FLOP DEVIL] LEVEL 1 CLEARED ({context}) | margin OUTSIDE range | {detail}"],
-                {
-                    "event": "LEVEL_1_CLEARED",
+                    "event": "LEVEL_1_MARGIN_" + word,
                     "context": context,
                     "virtual_win_rate": status["rate"],
                     "active_threshold": status["threshold"],
@@ -998,18 +999,17 @@ class Bot:
     # ---- Level 2 ----
     def ffd_pattern(self):
         """
-        The last three REAL resolved trades if they are all losses and their
-        stored inversion flags alternate perfectly (NO,YES,NO or YES,NO,YES);
-        otherwise None.  Uses each trade's own stored flag, never current state.
+        EARLY detection, look back one step: the last TWO real resolved trades
+        if both are losses and their stored inversion flags differ (YES,NO or
+        NO,YES); otherwise None.  Uses each trade's own stored flag, never the
+        current state.  Older trades are irrelevant.
         """
-        if len(self.ffd_recent) < 3:
+        if len(self.ffd_recent) < 2:
             return None
-        seq = list(self.ffd_recent)
+        seq = list(self.ffd_recent)[-2:]
         if any(t["won"] for t in seq):
             return None
         if seq[0]["inverted"] == seq[1]["inverted"]:
-            return None
-        if seq[1]["inverted"] == seq[2]["inverted"]:
             return None
         return seq
 
@@ -1037,6 +1037,11 @@ class Bot:
             "virtual_win_rate_at_detection": level1["rate"],
             "active_threshold_at_detection": level1["threshold"],
             "margin_at_detection": level1["margin"],
+            "margin_flag_at_detection": (
+                None
+                if level1["margin"] is None
+                else ("SMALL" if level1["active"] else "LARGE")
+            ),
             "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
             "engine_decision_at_detection": bool(requested),
             "level3_confirmed": False,
@@ -1060,23 +1065,29 @@ class Bot:
         self.ffd_basket = basket
 
         lines = [
-            f"\n[FLIP FLOP DEVIL] LEVEL 2 CONFIRMED | {symbol} | alternating real losses with "
-            f"Level 1 active"
+            f"\n[FLIP FLOP DEVIL] LEVEL 2 CONFIRMED (EARLY) | {symbol} | two alternating real "
+            f"losses and the engine continues the swing"
         ]
-        for label, t in zip("ABC", sequence):
+        for label, t in zip("AB", sequence):
             lines.append(
                 f"   Trade {label}: contract {t['contract_id']} | "
                 f"INVERTED {_yn(t['inverted'])} | {t['outcome']}"
                 f"{' (assumed)' if t['assumed'] else ''}"
             )
-        lines.append(
-            f"   Level 1: virtual win rate {_fmt_rate(level1['rate'])} vs active threshold "
-            f"{_pct_text(level1['threshold'])} -> margin {level1['margin']:.2f} pts "
-            f"<= {FLIP_FLOP_DEVIL_MARGIN:g}"
+        margin_text = (
+            "n/a (no virtual samples)"
+            if level1["margin"] is None
+            else f"{level1['margin']:.2f} pts, {'SMALL' if level1['active'] else 'LARGE'} "
+            f"(limit {FLIP_FLOP_DEVIL_MARGIN:g}; informational only)"
         )
         lines.append(
-            f"   Normal engine requests INVERTED {_yn(requested)} for the next trade "
-            f"(the alternation would continue)"
+            f"   Level 1 margin flag: virtual win rate {_fmt_rate(level1['rate'])} vs active "
+            f"threshold {_pct_text(level1['threshold'])} -> margin {margin_text}"
+        )
+        lines.append(
+            f"   Trade C (next, requested by the normal engine): INVERTED {_yn(requested)} -> "
+            f"full pattern {_yn(sequence[0]['inverted'])},{_yn(sequence[1]['inverted'])},"
+            f"{_yn(requested)} would emerge"
         )
         lines.append(
             f"   Watchdog intercepts the next trade: forcing INVERTED {_yn(not requested)}"
@@ -1104,7 +1115,9 @@ class Bot:
 
     def ffd_open_entry(self, basket, original_signal, requested, executed):
         """Record an intercepted trade (pending) in the active basket."""
-        executed_signal = INVERSE_SIGNAL[original_signal] if executed else original_signal
+        executed_signal = (
+            INVERSE_SIGNAL[original_signal] if executed else original_signal
+        )
         entry = {
             "basket_id": basket["basket_id"],
             "trade_no": len(basket["trades"]) + 1,
@@ -1157,9 +1170,9 @@ class Bot:
             basket = self.ffd_basket
             if basket is None:
                 seq = self.ffd_pattern()
+                # Level 1 (margin) is reported but NEVER gates the early sequence
                 if (
-                    not level1["active"]  # Level 1
-                    or seq is None  # three real losses, perfectly alternating
+                    seq is None  # last two real losses, flags differ
                     or requested == seq[-1]["inverted"]  # engine continues the swing
                 ):
                     return requested, None
@@ -1192,7 +1205,9 @@ class Bot:
             self.ffd_closed_baskets.append(basket)
             self.ffd_basket = None
             self.ffd_emit(
-                [f"[FLIP FLOP DEVIL] RESCUE BASKET CANCELLED | {basket['basket_id']} | {reason}"],
+                [
+                    f"[FLIP FLOP DEVIL] RESCUE BASKET CANCELLED | {basket['basket_id']} | {reason}"
+                ],
                 {"event": "BASKET_CANCELLED", "basket": basket},
             )
 
@@ -1221,13 +1236,22 @@ class Bot:
             )
         status = self.ffd_level1_status()
         if status["margin"] is None:
-            level1 = "Level 1 n/a (no virtual samples)"
+            level1 = "Level 1 margin n/a (no virtual samples)"
         else:
             level1 = (
-                f"Level 1 {'DETECTED' if status['active'] else 'not detected'} "
-                f"(margin {status['margin']:.2f} pts, limit {FLIP_FLOP_DEVIL_MARGIN:g})"
+                f"Level 1 margin {'SMALL' if status['active'] else 'LARGE'} "
+                f"({status['margin']:.2f} pts, limit {FLIP_FLOP_DEVIL_MARGIN:g}; informational)"
             )
-        return f"idle | {level1} | closed baskets: {len(self.ffd_closed_baskets)}"
+        seq = self.ffd_pattern()
+        if seq is None:
+            watch = "sequence watch: not armed"
+        else:
+            watch = (
+                f"sequence watch: ARMED ({_yn(seq[0]['inverted'])},{_yn(seq[1]['inverted'])} "
+                f"both lost; intervenes if the engine requests INVERTED "
+                f"{_yn(seq[0]['inverted'])})"
+            )
+        return f"idle | {watch} | {level1} | closed baskets: {len(self.ffd_closed_baskets)}"
 
     def ffd_on_resolution(self, meta, status, assumed, before):
         """
@@ -1310,8 +1334,15 @@ class Bot:
         if projected_won:
             entry["level"] = basket["level"]
             self.ffd_emit(lines)
-            self.ffd_emit(None, {"event": "TRADE_RESOLVED", "basket_id": basket["basket_id"],
-                                 "entry": entry, "basket_stats": basket["stats"]})
+            self.ffd_emit(
+                None,
+                {
+                    "event": "TRADE_RESOLVED",
+                    "basket_id": basket["basket_id"],
+                    "entry": entry,
+                    "basket_stats": basket["stats"],
+                },
+            )
             self.ffd_close_basket(basket, entry)
             return
 
@@ -1348,8 +1379,15 @@ class Bot:
             f"   Watchdog remains ACTIVE (projected {projected_outcome}: devil not defeated yet)"
         )
         self.ffd_emit(lines)
-        self.ffd_emit(None, {"event": "TRADE_RESOLVED", "basket_id": basket["basket_id"],
-                             "entry": entry, "basket_stats": basket["stats"]})
+        self.ffd_emit(
+            None,
+            {
+                "event": "TRADE_RESOLVED",
+                "basket_id": basket["basket_id"],
+                "entry": entry,
+                "basket_stats": basket["stats"],
+            },
+        )
         if level3_new:
             self.ffd_emit(
                 None,
@@ -1819,7 +1857,9 @@ class Bot:
                 # [MINTRADES] warm-up); SKIP never reaches this branch, so it
                 # can never be inverted.
                 original_signal = contract_type
-                requested = original_signal in INVERSE_SIGNAL and self.decide_inversion()
+                requested = (
+                    original_signal in INVERSE_SIGNAL and self.decide_inversion()
+                )
 
                 # [WATCHDOG] captures the engine's request and may override the
                 # EXECUTION mode only (never the signal, threshold or stats).
