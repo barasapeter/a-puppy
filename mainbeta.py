@@ -103,24 +103,47 @@ Key ideas
   existing resolution path, so every resolved contract (normal, status query or
   assumed loss) affects it exactly once and a late result never does.
 
-* [BRAKE] LOSS-STREAK BRAKE: the threshold feedback can flip the bot between
-  normal and inverted mode after EVERY loss (a normal loss raises the threshold,
-  an inverted loss lowers it), which just alternates sides in a choppy market.
-  Once the consecutive real-loss streak reaches LOSS_STREAK_BRAKE_AFTER:
-      "HOLD" - the inversion mode of the last resolved trade is kept instead of
-               being re-decided, BUT ONLY while the evidence is ambiguous, i.e.
-               the virtual win rate is within LOSS_STREAK_BRAKE_HOLD_MARGIN
-               points of the active threshold.  A decisive virtual win rate
-               (further away than the margin) always goes through the normal
-               threshold rule, so the brake can never pin the bot to a mode
-               that the virtual win rate clearly says is losing.
-      "SKIP" - the next LOSS_STREAK_BRAKE_SKIP_SIGNALS signals are skipped, then
-               one trade is allowed again (and the skip counter re-arms while
-               the streak continues)
-  A real win ends the brake.  The martingale is NOT affected by the brake.
+* [MINTRADES] INVERSION WARM-UP: until INVERSION_MIN_RESOLVED_TRADES trades have
+  been definitively resolved, NO inversion mechanism may act: the normal
+  inversion engine answers "no inversion" and the Flip Flop Devil watchdog can
+  neither detect nor override.  Each resolved trade is counted exactly once,
+  inside record_inversion_result (the single resolution path, guarded by the
+  `resolved` set and by trade_meta.pop), so duplicate settlement notifications,
+  status-query answers and reconnect re-subscriptions can never count twice.
+  Pending / merely executed trades are not counted.  The counter lives on the
+  Bot instance, so it survives WebSocket reconnects.  Once the requirement is
+  met the existing inversion logic runs exactly as before.
+
+* [WATCHDOG] FLIP FLOP DEVIL WATCHDOG (replaces the old loss-streak brake).  The
+  threshold feedback can make the engine alternate normal / inverted execution
+  after every loss (a normal loss raises the threshold, an inverted loss lowers
+  it) so neither side ever wins.  The watchdog is an EXECUTION-MODE watchdog:
+  it never touches the signal, the threshold, the virtual statistics, the
+  martingale, the P&L or the orders' count.  Three levels:
+
+      LEVEL 1  |virtual win rate - active threshold| <= FLIP_FLOP_DEVIL_MARGIN
+               (preliminary warning only; no override of any kind)
+      LEVEL 2  Level 1 active AND the last three REAL resolved trades are all
+               losses AND their stored `inverted` flags alternate perfectly
+               (NO,YES,NO or YES,NO,YES) AND the normal engine wants the next
+               trade to continue the alternation.  A rescue basket is created
+               and the next trade is executed with the OPPOSITE of the
+               inversion the normal engine asked for.
+      LEVEL 3  After a rescued trade resolves, the normal engine (re-evaluated
+               on the updated statistics) still asks for the mode the watchdog
+               suppressed -> the intervention is verified.
+
+  While a basket is active every trade is forced to the opposite of the normal
+  engine's request.  Each resolved rescued trade gets a COUNTERFACTUAL
+  projection (the trade as the normal engine wanted it: PUT/CALL are opposite,
+  so projected outcome = opposite of the actual one).  The basket closes ONLY
+  when a projected outcome is a WIN ("devil defeated"); the normal engine then
+  resumes control from its current state.  Baskets are purely observational and
+  persisted to FLIP_FLOP_DEVIL_LOG_FILE.
 """
 
 import asyncio
+import copy
 import json
 import math
 import os
@@ -210,14 +233,16 @@ THRESHOLD_MIN = 34.0  # the active threshold never goes below this
 THRESHOLD_MAX = 53.0  # the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
 
-# [BRAKE] loss-streak brake (stops the normal <-> inverted flip-flop in a streak)
-LOSS_STREAK_BRAKE_ENABLED = False
-LOSS_STREAK_BRAKE_AFTER = 7  # consecutive real losses before the brake engages
-LOSS_STREAK_BRAKE_ACTION = "HOLD"  # "HOLD" = keep last mode, "SKIP" = skip signals
-# HOLD only applies while |virtual win rate - active threshold| <= this many
-# percentage points (ambiguous zone); beyond it the threshold rule decides.
-LOSS_STREAK_BRAKE_HOLD_MARGIN = 3.0
-LOSS_STREAK_BRAKE_SKIP_SIGNALS = 3  # signals skipped per cycle in SKIP mode
+# [MINTRADES] inversion warm-up: until this many trades are definitively
+# resolved, every signal executes normally (no inversion of any kind, and no
+# watchdog override).  0 disables the warm-up.
+INVERSION_MIN_RESOLVED_TRADES = 4
+
+# [WATCHDOG] Flip Flop Devil watchdog (replaces the old loss-streak brake)
+FLIP_FLOP_DEVIL_ENABLED = True
+FLIP_FLOP_DEVIL_MARGIN = 3.0  # Level 1: max |virtual win rate - active threshold| (pts)
+FLIP_FLOP_DEVIL_LOG_ENABLED = True
+FLIP_FLOP_DEVIL_LOG_FILE = "flip_flop_devil_events.json"  # JSON array of events
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
 # calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
@@ -306,6 +331,17 @@ def _signed_pct_text(value):
     return ("+" if value > 0 else "-") + _pct_text(abs(value))
 
 
+# [WATCHDOG] helpers
+def _fmt_rate(value):
+    """Percentage with two decimals, or 'n/a' when there is no sample."""
+    return "n/a" if value is None else f"{value:.2f}%"
+
+
+def _yn(flag):
+    """Inversion flag as text: True -> 'YES', False -> 'NO'."""
+    return "YES" if flag else "NO"
+
+
 # [ROLLING] configuration validation (fails loudly instead of miscalculating)
 def validate_virtual_rate_config():
     if VIRTUAL_WIN_RATE_MODE not in ("WINDOW", "ALL"):
@@ -362,31 +398,47 @@ def validate_threshold_config():
 validate_threshold_config()
 
 
-# [BRAKE] configuration validation
-def validate_brake_config():
-    if LOSS_STREAK_BRAKE_ACTION not in ("HOLD", "SKIP"):
-        raise ValueError(
-            f"LOSS_STREAK_BRAKE_ACTION must be 'HOLD' or 'SKIP', "
-            f"got {LOSS_STREAK_BRAKE_ACTION!r}"
-        )
-    for name, value in (
-        ("LOSS_STREAK_BRAKE_AFTER", LOSS_STREAK_BRAKE_AFTER),
-        ("LOSS_STREAK_BRAKE_SKIP_SIGNALS", LOSS_STREAK_BRAKE_SKIP_SIGNALS),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+# [MINTRADES] / [WATCHDOG] configuration validation
+def validate_watchdog_config():
     if (
-        isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, bool)
-        or not isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, (int, float))
-        or LOSS_STREAK_BRAKE_HOLD_MARGIN < 0
+        isinstance(INVERSION_MIN_RESOLVED_TRADES, bool)
+        or not isinstance(INVERSION_MIN_RESOLVED_TRADES, int)
+        or INVERSION_MIN_RESOLVED_TRADES < 0
     ):
         raise ValueError(
-            f"LOSS_STREAK_BRAKE_HOLD_MARGIN must be a number >= 0, "
-            f"got {LOSS_STREAK_BRAKE_HOLD_MARGIN!r}"
+            f"INVERSION_MIN_RESOLVED_TRADES must be a non-negative integer, "
+            f"got {INVERSION_MIN_RESOLVED_TRADES!r}"
+        )
+    if not isinstance(FLIP_FLOP_DEVIL_ENABLED, bool):
+        raise ValueError(
+            f"FLIP_FLOP_DEVIL_ENABLED must be True or False, "
+            f"got {FLIP_FLOP_DEVIL_ENABLED!r}"
+        )
+    if (
+        isinstance(FLIP_FLOP_DEVIL_MARGIN, bool)
+        or not isinstance(FLIP_FLOP_DEVIL_MARGIN, (int, float))
+        or not (0.0 <= FLIP_FLOP_DEVIL_MARGIN <= 100.0)
+    ):
+        raise ValueError(
+            f"FLIP_FLOP_DEVIL_MARGIN must be a number between 0 and 100 "
+            f"(percentage points), got {FLIP_FLOP_DEVIL_MARGIN!r}"
+        )
+    if not isinstance(FLIP_FLOP_DEVIL_LOG_ENABLED, bool):
+        raise ValueError(
+            f"FLIP_FLOP_DEVIL_LOG_ENABLED must be True or False, "
+            f"got {FLIP_FLOP_DEVIL_LOG_ENABLED!r}"
+        )
+    if (
+        not isinstance(FLIP_FLOP_DEVIL_LOG_FILE, str)
+        or not FLIP_FLOP_DEVIL_LOG_FILE.strip()
+    ):
+        raise ValueError(
+            f"FLIP_FLOP_DEVIL_LOG_FILE must be a non-empty string, "
+            f"got {FLIP_FLOP_DEVIL_LOG_FILE!r}"
         )
 
 
-validate_brake_config()
+validate_watchdog_config()
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +491,8 @@ class Order:
     query_outstanding: bool = False  # [TIMEOUT] a query is awaiting its answer
     original_signal: str | None = None  # [INVERT] signal returned by infer_market_bias
     inverted: bool = False  # [INVERT] fixed at creation, never changed afterwards
+    requested_inverted: bool = False  # [WATCHDOG] what the NORMAL engine asked for
+    wd_entry: dict | None = None  # [WATCHDOG] rescue-basket entry, if intercepted
 
 
 # --------------------------------------------------------------------------- #
@@ -475,7 +529,10 @@ class Bot:
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
 
         # [INVERT] independent inversion statistics
-        self.trade_meta = {}  # contract_id -> {"original", "executed", "inverted"}
+        # contract_id -> {"contract_id", "original", "executed", "inverted",
+        #                 "requested_inverted", "watchdog_intervened",
+        #                 "basket_id", "projected_inverted", "wd_entry"}
+        self.trade_meta = {}
         self.real_wins = self.real_losses = 0  # actual execution outcomes
         self.virtual_wins = self.virtual_losses = 0  # LIFETIME original-signal outcomes
         # [ROLLING] ordered virtual outcomes (True = virtual WIN) and the ACTIVE
@@ -499,9 +556,16 @@ class Bot:
         self.threshold_loss_streak = 0  # consecutive REAL losses (acceleration index)
         self.last_threshold_change = None  # description of the latest movement
 
-        # [BRAKE] last resolved trade's inversion mode and SKIP-mode cooldown
-        self.last_trade_inverted = None
-        self.brake_skips_left = 0
+        # [MINTRADES] definitively resolved trades, each counted exactly once
+        self.resolved_trade_count = 0
+
+        # [WATCHDOG] Flip Flop Devil state
+        self.ffd_recent = deque(maxlen=3)  # last real resolved trades (stored flags)
+        self.ffd_basket = None  # the ACTIVE rescue basket (None = watchdog idle)
+        self.ffd_closed_baskets = []  # closed / cancelled baskets, kept all session
+        self.ffd_basket_seq = 0  # unique basket id counter
+        self.ffd_level1_active = None  # last evaluated Level 1 state (None = unknown)
+        self.ffd_queue = []  # (console lines, JSON record) pairs awaiting flush
 
     # ----------------------------------------------------------------- utils
     def trigger_count(self):
@@ -510,6 +574,14 @@ class Bot:
     def release(self):
         self.busy = False
         self.order = None
+
+    def abort_order(self, reason):
+        """Release a pending order that never became a contract ([WATCHDOG]-aware)."""
+        order = self.order
+        if order is not None:
+            self.ffd_discard_entry(order.wd_entry, reason)
+            self.ffd_flush()
+        self.release()
 
     async def send(self, payload):
         await self.ws.send(dumps(payload))
@@ -550,13 +622,6 @@ class Bot:
         # [THRESHOLD] the dynamically adjusted threshold, not the baseline
         return self.active_virtual_wins * 100 <= self.active_threshold * total
 
-    # [BRAKE] -----------------------------------------------------------
-    def brake_active(self):
-        return (
-            LOSS_STREAK_BRAKE_ENABLED
-            and self.threshold_loss_streak >= LOSS_STREAK_BRAKE_AFTER
-        )
-
     def virtual_rate_pct(self):
         """Active virtual win rate in percent, or None with no samples."""
         total = self.active_virtual_wins + self.active_virtual_losses
@@ -564,68 +629,20 @@ class Bot:
             return None
         return self.active_virtual_wins * 100 / total
 
-    def brake_holds(self):
-        """
-        True when the HOLD brake overrides the threshold rule: brake engaged,
-        HOLD action, a previous mode exists, and the virtual win rate lies
-        inside the ambiguous zone around the active threshold.
-        """
-        if (
-            not self.brake_active()
-            or LOSS_STREAK_BRAKE_ACTION != "HOLD"
-            or self.last_trade_inverted is None
-        ):
-            return False
-        rate = self.virtual_rate_pct()
-        if rate is None:
-            return False
-        return (
-            round(abs(rate - self.active_threshold), 6) <= LOSS_STREAK_BRAKE_HOLD_MARGIN
-        )
+    # [MINTRADES] -------------------------------------------------------
+    def inversion_allowed(self):
+        """True once enough trades are definitively resolved for any inversion."""
+        return self.resolved_trade_count >= INVERSION_MIN_RESOLVED_TRADES
 
     def decide_inversion(self):
         """
-        Inversion state for the next order.  The threshold rule decides, except
-        while the HOLD brake is engaged AND the evidence is ambiguous: then the
-        last trade's mode is kept.
+        The NORMAL inversion engine's decision for the next order.  Locked to
+        "no inversion" during the warm-up; afterwards exactly inversion_active().
+        The watchdog captures this decision and may override the EXECUTION only.
         """
-        if self.brake_holds():
-            return self.last_trade_inverted
+        if not self.inversion_allowed():
+            return False
         return self.inversion_active()
-
-    def brake_should_skip(self):
-        """SKIP mode: True (and counts one skipped signal) while cooling down."""
-        if (
-            self.brake_active()
-            and LOSS_STREAK_BRAKE_ACTION == "SKIP"
-            and self.brake_skips_left > 0
-        ):
-            self.brake_skips_left -= 1
-            return True
-        return False
-
-    def brake_text(self):
-        if not LOSS_STREAK_BRAKE_ENABLED:
-            return "DISABLED"
-        if not self.brake_active():
-            return f"inactive (engages at {LOSS_STREAK_BRAKE_AFTER} consecutive losses)"
-        if LOSS_STREAK_BRAKE_ACTION == "HOLD":
-            rate = self.virtual_rate_pct()
-            if self.brake_holds():
-                mode = "INVERTED" if self.last_trade_inverted else "NORMAL"
-                return (
-                    f"ACTIVE (HOLD: virtual {rate:.1f}% is within "
-                    f"{LOSS_STREAK_BRAKE_HOLD_MARGIN:g} pts of threshold, "
-                    f"next trade keeps {mode} mode)"
-                )
-            if rate is None:
-                return "ACTIVE (HOLD: no virtual samples, threshold rule decides)"
-            return (
-                f"ACTIVE (HOLD standing down: virtual {rate:.1f}% is "
-                f"{abs(rate - self.active_threshold):.1f} pts from threshold, "
-                f"> {LOSS_STREAK_BRAKE_HOLD_MARGIN:g}; threshold rule decides)"
-            )
-        return f"ACTIVE (SKIP: {self.brake_skips_left} signal(s) left to skip)"
 
     def record_virtual_outcome(self, virtual_win):
         """
@@ -676,7 +693,6 @@ class Bot:
         """
         if won:
             self.threshold_loss_streak = 0  # next loss starts at the base delta
-            self.brake_skips_left = 0  # [BRAKE] a real win ends the brake
             inverted = bool(inverted)
 
             # most recent outstanding adjustment of THIS trade's type
@@ -741,8 +757,6 @@ class Bot:
             }
         )
         self.active_threshold = target
-        if self.brake_active():  # [BRAKE] (re)arm the SKIP-mode cooldown
-            self.brake_skips_left = LOSS_STREAK_BRAKE_SKIP_SIGNALS
         self.last_threshold_change = {
             "kind": "loss",
             "change": applied,
@@ -789,18 +803,29 @@ class Bot:
         side = "inverted" if info["entry_inverted"] else "normal"
         return f"0.0% (win: no outstanding {side} adjustment to reverse)"
 
-    def record_inversion_result(self, meta, status):
+    def record_inversion_result(self, meta, status, assumed=False):
         """
         Update real / virtual / inverted / non-inverted counters for ONE
-        resolved trade, and feed the [THRESHOLD] detector.  Callers guarantee
-        a single call per contract (the `resolved` set guards the normal path,
-        assume_loss marks the contract resolved first).
+        resolved trade, and feed the [THRESHOLD] detector, the [MINTRADES]
+        counter and the [WATCHDOG].  Callers guarantee a single call per
+        contract (the `resolved` set guards the normal path, assume_loss marks
+        the contract resolved first, and trade_meta.pop hands the metadata out
+        only once).  `assumed` is True for the assumed-loss fallback.
         """
         if status not in ("won", "lost") or meta is None:
+            if meta is not None:  # [WATCHDOG] never leave a pending basket entry
+                self.ffd_discard_entry(
+                    meta.get("wd_entry"), f"contract ended with status {status!r}"
+                )
             return
         won = status == "won"
         inverted = meta["inverted"]
-        self.last_trade_inverted = bool(inverted)  # [BRAKE]
+
+        # [WATCHDOG] state before this resolution moves anything
+        before = {"threshold": self.active_threshold, "rate": self.virtual_rate_pct()}
+
+        # [MINTRADES] one definitively resolved trade, counted exactly once
+        self.resolved_trade_count += 1
 
         # real: what actually happened
         if won:
@@ -829,6 +854,12 @@ class Bot:
         # [THRESHOLD] real outcome + the trade's own execution flag
         self.update_threshold(inverted, won)
 
+        # [WATCHDOG] observational only; must never disturb trading
+        try:
+            self.ffd_on_resolution(meta, status, assumed, before)
+        except Exception as error:
+            print(f"[FLIP FLOP DEVIL] internal error on resolution: {error}")
+
     def inversion_report(self, meta, status, contract_id):
         """Report lines, built AFTER the counters include the current trade."""
         if status not in ("won", "lost"):
@@ -840,12 +871,11 @@ class Bot:
             )
             return
         outcome = "WIN" if status == "won" else "LOSS"
-        inv_state = "ON" if self.decide_inversion() else "OFF"  # [BRAKE]
-        rule_state = "ON" if self.inversion_active() else "OFF"
-        if self.brake_holds():
+        inv_state = "ON" if self.decide_inversion() else "OFF"
+        if not self.inversion_allowed():
             inv_reason = (
-                f"held by brake; threshold rule says {rule_state} "
-                f"at <= {_pct_text(self.active_threshold)}"
+                f"warm-up: {self.resolved_trade_count}/"
+                f"{INVERSION_MIN_RESOLVED_TRADES} resolved trades"
             )
         else:
             inv_reason = f"threshold <= {_pct_text(self.active_threshold)}"
@@ -878,9 +908,490 @@ class Bot:
         print(f"   Current Loss Streak: {self.threshold_loss_streak}")
         print(f"   Outstanding Adjustments: {len(self.threshold_stack)}")
         print(f"   Last Adjustment: {self.threshold_change_text()}")
-        print(f"   Loss-Streak Brake: {self.brake_text()}")  # [BRAKE]
-        print(f"   Inversion for next signal: {inv_state} " f"({inv_reason})")
+        print(  # [MINTRADES]
+            f"   Resolved Trades Counted: {self.resolved_trade_count} "
+            f"(inversion unlocks at {INVERSION_MIN_RESOLVED_TRADES})"
+        )
+        print(f"   Flip Flop Devil: {self.ffd_status_text()}")  # [WATCHDOG]
+        print(
+            f"   Inversion for next signal (normal engine): {inv_state} "
+            f"({inv_reason})"
+        )
         print("   ----------------------------------------------------")
+
+    # [WATCHDOG] --------------------------------------------------------
+    @staticmethod
+    def _iso_now():
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def ffd_emit(self, lines=None, record=None):
+        """Queue console lines and/or one JSON record; ffd_flush() writes them."""
+        if record is not None:
+            record = copy.deepcopy(record)  # snapshot: later mutations don't leak
+            record.setdefault("logged_at", self._iso_now())
+        self.ffd_queue.append((list(lines or []), record))
+
+    def ffd_flush(self):
+        """Print and persist everything queued.  Never raises."""
+        queue, self.ffd_queue = self.ffd_queue, []
+        for lines, record in queue:
+            for line in lines:
+                print(line)
+            if record is not None and FLIP_FLOP_DEVIL_LOG_ENABLED:
+                try:
+                    self.save_record(record, FLIP_FLOP_DEVIL_LOG_FILE)
+                except Exception as error:
+                    print(f"[FLIP FLOP DEVIL] failed to save event: {error}")
+
+    # ---- Level 1 ----
+    def ffd_level1_status(self):
+        """Margin between the ACTIVE virtual win rate and the ACTIVE threshold."""
+        rate = self.virtual_rate_pct()
+        threshold = self.active_threshold
+        if rate is None:  # no virtual samples: Level 1 cannot be confirmed
+            return {"active": False, "rate": None, "threshold": threshold, "margin": None}
+        margin = round(abs(rate - threshold), 6)
+        return {
+            "active": margin <= FLIP_FLOP_DEVIL_MARGIN,
+            "rate": rate,
+            "threshold": threshold,
+            "margin": margin,
+        }
+
+    def ffd_refresh_level1(self, context):
+        """Evaluate Level 1 now; report only when it switches on / off."""
+        status = self.ffd_level1_status()
+        previous = self.ffd_level1_active
+        self.ffd_level1_active = status["active"]
+        detail = (
+            f"virtual win rate {_fmt_rate(status['rate'])} vs active threshold "
+            f"{_pct_text(status['threshold'])} -> margin "
+            f"{'n/a' if status['margin'] is None else format(status['margin'], '.2f')} "
+            f"pts (limit {FLIP_FLOP_DEVIL_MARGIN:g})"
+        )
+        if status["active"] and not previous:
+            self.ffd_emit(
+                [f"[FLIP FLOP DEVIL] LEVEL 1 DETECTED ({context}) | margin WITHIN range | {detail}"],
+                {
+                    "event": "LEVEL_1_DETECTED",
+                    "context": context,
+                    "virtual_win_rate": status["rate"],
+                    "active_threshold": status["threshold"],
+                    "margin": status["margin"],
+                    "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
+                },
+            )
+        elif previous and not status["active"]:
+            self.ffd_emit(
+                [f"[FLIP FLOP DEVIL] LEVEL 1 CLEARED ({context}) | margin OUTSIDE range | {detail}"],
+                {
+                    "event": "LEVEL_1_CLEARED",
+                    "context": context,
+                    "virtual_win_rate": status["rate"],
+                    "active_threshold": status["threshold"],
+                    "margin": status["margin"],
+                    "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
+                },
+            )
+        return status
+
+    # ---- Level 2 ----
+    def ffd_pattern(self):
+        """
+        The last three REAL resolved trades if they are all losses and their
+        stored inversion flags alternate perfectly (NO,YES,NO or YES,NO,YES);
+        otherwise None.  Uses each trade's own stored flag, never current state.
+        """
+        if len(self.ffd_recent) < 3:
+            return None
+        seq = list(self.ffd_recent)
+        if any(t["won"] for t in seq):
+            return None
+        if seq[0]["inverted"] == seq[1]["inverted"]:
+            return None
+        if seq[1]["inverted"] == seq[2]["inverted"]:
+            return None
+        return seq
+
+    def ffd_create_basket(self, symbol, seq, level1, requested):
+        """Create the rescue basket the moment Level 2 is confirmed."""
+        self.ffd_basket_seq += 1
+        basket_id = f"FFD-{self.ffd_basket_seq:04d}"
+        sequence = [
+            {
+                "contract_id": t["contract_id"],
+                "inverted": t["inverted"],
+                "outcome": "WIN" if t["won"] else "LOSS",
+                "assumed": t["assumed"],
+            }
+            for t in seq
+        ]
+        basket = {
+            "basket_id": basket_id,
+            "status": "ACTIVE",
+            "created_at": self._iso_now(),
+            "symbol": symbol,
+            "initial_level": 2,
+            "level": 2,
+            "initial_sequence": sequence,
+            "virtual_win_rate_at_detection": level1["rate"],
+            "active_threshold_at_detection": level1["threshold"],
+            "margin_at_detection": level1["margin"],
+            "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
+            "engine_decision_at_detection": bool(requested),
+            "level3_confirmed": False,
+            "level3_confirmed_at_trade": None,
+            "trades": [],
+            "stats": {
+                "total_rescued": 0,
+                "actual_wins": 0,
+                "actual_losses": 0,
+                "projected_wins": 0,
+                "projected_losses": 0,
+                "projected_losses_avoided": 0,
+                "projected_wins_missed": 0,
+            },
+            "duration_resolved_trades": 0,
+            "closed_at": None,
+            "closure_reason": None,
+            "defeated_devil": False,
+            "defeating_trade": None,
+        }
+        self.ffd_basket = basket
+
+        lines = [
+            f"\n[FLIP FLOP DEVIL] LEVEL 2 CONFIRMED | {symbol} | alternating real losses with "
+            f"Level 1 active"
+        ]
+        for label, t in zip("ABC", sequence):
+            lines.append(
+                f"   Trade {label}: contract {t['contract_id']} | "
+                f"INVERTED {_yn(t['inverted'])} | {t['outcome']}"
+                f"{' (assumed)' if t['assumed'] else ''}"
+            )
+        lines.append(
+            f"   Level 1: virtual win rate {_fmt_rate(level1['rate'])} vs active threshold "
+            f"{_pct_text(level1['threshold'])} -> margin {level1['margin']:.2f} pts "
+            f"<= {FLIP_FLOP_DEVIL_MARGIN:g}"
+        )
+        lines.append(
+            f"   Normal engine requests INVERTED {_yn(requested)} for the next trade "
+            f"(the alternation would continue)"
+        )
+        lines.append(
+            f"   Watchdog intercepts the next trade: forcing INVERTED {_yn(not requested)}"
+        )
+        lines.append(
+            f"[FLIP FLOP DEVIL] RESCUE BASKET CREATED | {basket_id} | symbol {symbol} | "
+            f"level 2"
+        )
+        self.ffd_emit(
+            lines,
+            {
+                "event": "LEVEL_2_CONFIRMED",
+                "basket_id": basket_id,
+                "symbol": symbol,
+                "initial_sequence": sequence,
+                "virtual_win_rate": level1["rate"],
+                "active_threshold": level1["threshold"],
+                "margin": level1["margin"],
+                "margin_limit": FLIP_FLOP_DEVIL_MARGIN,
+                "engine_requested_inversion": bool(requested),
+            },
+        )
+        self.ffd_emit(None, {"event": "BASKET_CREATED", "basket": basket})
+        return basket
+
+    def ffd_open_entry(self, basket, original_signal, requested, executed):
+        """Record an intercepted trade (pending) in the active basket."""
+        executed_signal = INVERSE_SIGNAL[original_signal] if executed else original_signal
+        entry = {
+            "basket_id": basket["basket_id"],
+            "trade_no": len(basket["trades"]) + 1,
+            "status": "PENDING",
+            "intercepted_at": self._iso_now(),
+            "resolved_at": None,
+            "symbol": basket["symbol"],
+            "contract_id": None,
+            "original_signal": original_signal,
+            "executed_signal": executed_signal,
+            "requested_inversion": bool(requested),
+            "executed_inversion": bool(executed),
+            "projected_inversion": bool(requested),
+            "actual_outcome": None,
+            "projected_outcome": None,
+            "assumed": False,
+            "threshold_before": self.active_threshold,
+            "threshold_after": None,
+            "virtual_win_rate_before": self.virtual_rate_pct(),
+            "virtual_win_rate_after": None,
+            "real_loss_streak": None,
+            "level": basket["level"],
+            "defeated_devil": False,
+            "engine_next_decision": None,
+            "engine_continues_pattern": None,
+        }
+        basket["trades"].append(entry)
+        self.ffd_emit(
+            [
+                f"[FLIP FLOP DEVIL] INTERVENTION ACTIVE | {basket['basket_id']} | rescued "
+                f"trade #{entry['trade_no']} | engine requested INVERTED {_yn(requested)} -> "
+                f"forced INVERTED {_yn(executed)} | original {original_signal} -> executing "
+                f"{executed_signal}"
+            ],
+            {"event": "INTERVENTION", "entry": entry},
+        )
+        return entry
+
+    def watchdog_decide(self, symbol, original_signal, requested):
+        """
+        Decide the EXECUTED inversion, given the normal engine's `requested`
+        decision.  Returns (executed_inverted, basket_entry_or_None).  Pure
+        in-memory work (events are queued, flushed after the order is sent).
+        """
+        requested = bool(requested)
+        if not FLIP_FLOP_DEVIL_ENABLED or not self.inversion_allowed():
+            return requested, None
+        try:
+            level1 = self.ffd_refresh_level1("signal")
+            basket = self.ffd_basket
+            if basket is None:
+                seq = self.ffd_pattern()
+                if (
+                    not level1["active"]  # Level 1
+                    or seq is None  # three real losses, perfectly alternating
+                    or requested == seq[-1]["inverted"]  # engine continues the swing
+                ):
+                    return requested, None
+                basket = self.ffd_create_basket(symbol, seq, level1, requested)
+            executed = not requested
+            entry = self.ffd_open_entry(basket, original_signal, requested, executed)
+            return executed, entry
+        except Exception as error:
+            print(f"[FLIP FLOP DEVIL] internal error on decision: {error}")
+            return requested, None
+
+    def ffd_discard_entry(self, entry, reason):
+        """An intercepted order that never became a resolved trade is withdrawn."""
+        if entry is None or entry.get("status") != "PENDING":
+            return
+        basket = self.ffd_basket
+        if basket is None or basket["basket_id"] != entry["basket_id"]:
+            return
+        basket["trades"] = [e for e in basket["trades"] if e is not entry]
+        entry["status"] = "VOID"
+        lines = [
+            f"[FLIP FLOP DEVIL] rescued trade #{entry['trade_no']} of {basket['basket_id']} "
+            f"withdrawn ({reason}); not counted"
+        ]
+        self.ffd_emit(lines, {"event": "ENTRY_VOID", "reason": reason, "entry": entry})
+        if not basket["trades"] and basket["stats"]["total_rescued"] == 0:
+            basket["status"] = "CANCELLED"
+            basket["closed_at"] = self._iso_now()
+            basket["closure_reason"] = f"no rescued trade ever resolved ({reason})"
+            self.ffd_closed_baskets.append(basket)
+            self.ffd_basket = None
+            self.ffd_emit(
+                [f"[FLIP FLOP DEVIL] RESCUE BASKET CANCELLED | {basket['basket_id']} | {reason}"],
+                {"event": "BASKET_CANCELLED", "basket": basket},
+            )
+
+    # ---- resolution (called from record_inversion_result, once per contract) ----
+    @staticmethod
+    def ffd_stats_text(basket):
+        s = basket["stats"]
+        return (
+            f"rescued {s['total_rescued']} | actual {s['actual_wins']}W {s['actual_losses']}L | "
+            f"projected {s['projected_wins']}W {s['projected_losses']}L | "
+            f"projected losses avoided {s['projected_losses_avoided']} | "
+            f"projected wins missed {s['projected_wins_missed']} | "
+            f"level {basket['level']} | duration {basket['duration_resolved_trades']} "
+            f"resolved trade(s)"
+        )
+
+    def ffd_status_text(self):
+        if not FLIP_FLOP_DEVIL_ENABLED:
+            return "DISABLED"
+        basket = self.ffd_basket
+        if basket is not None:
+            return (
+                f"ACTIVE {basket['basket_id']} (level {basket['level']}, "
+                f"{basket['stats']['total_rescued']} rescued trade(s); the next trade is "
+                f"forced to the opposite of the engine's request)"
+            )
+        status = self.ffd_level1_status()
+        if status["margin"] is None:
+            level1 = "Level 1 n/a (no virtual samples)"
+        else:
+            level1 = (
+                f"Level 1 {'DETECTED' if status['active'] else 'not detected'} "
+                f"(margin {status['margin']:.2f} pts, limit {FLIP_FLOP_DEVIL_MARGIN:g})"
+            )
+        return f"idle | {level1} | closed baskets: {len(self.ffd_closed_baskets)}"
+
+    def ffd_on_resolution(self, meta, status, assumed, before):
+        """
+        Feed ONE resolved real trade (won / lost) to the watchdog: keep the
+        rolling real-outcome sequence and, if this trade was intercepted by the
+        active basket, record its actual + counterfactual result.
+        """
+        if not FLIP_FLOP_DEVIL_ENABLED:
+            return
+        won = status == "won"
+        inverted = bool(meta["inverted"])
+        self.ffd_recent.append(
+            {
+                "contract_id": meta.get("contract_id"),
+                "inverted": inverted,
+                "won": won,
+                "assumed": bool(assumed),
+            }
+        )
+        entry = meta.get("wd_entry")
+        basket = self.ffd_basket
+        if (
+            entry is not None
+            and basket is not None
+            and entry["basket_id"] == basket["basket_id"]
+            and entry["status"] == "PENDING"
+        ):
+            self.ffd_resolve_entry(basket, entry, meta, won, assumed, before)
+        self.ffd_refresh_level1("resolution")
+
+    def ffd_resolve_entry(self, basket, entry, meta, won, assumed, before):
+        inverted = bool(meta["inverted"])
+        requested = bool(entry["requested_inversion"])
+        # Counterfactual: the trade as the normal engine wanted it.  PUT / CALL
+        # are opposite directions, so a different execution mode flips the
+        # binary outcome; an identical mode would keep it.
+        projected_won = (not won) if requested != inverted else won
+        actual_outcome = "WIN" if won else "LOSS"
+        projected_outcome = "WIN" if projected_won else "LOSS"
+
+        entry["status"] = "RESOLVED"
+        entry["resolved_at"] = self._iso_now()
+        entry["contract_id"] = meta.get("contract_id")
+        entry["assumed"] = bool(assumed)
+        entry["actual_outcome"] = actual_outcome
+        entry["projected_inversion"] = requested
+        entry["projected_outcome"] = projected_outcome
+        entry["threshold_before"] = before["threshold"]
+        entry["threshold_after"] = self.active_threshold
+        entry["virtual_win_rate_before"] = before["rate"]
+        entry["virtual_win_rate_after"] = self.virtual_rate_pct()
+        entry["real_loss_streak"] = self.threshold_loss_streak
+
+        stats = basket["stats"]
+        stats["total_rescued"] += 1
+        stats["actual_wins" if won else "actual_losses"] += 1
+        if projected_won:
+            stats["projected_wins"] += 1
+            stats["projected_wins_missed"] += 1
+        else:
+            stats["projected_losses"] += 1
+            stats["projected_losses_avoided"] += 1
+        basket["duration_resolved_trades"] = stats["total_rescued"]
+
+        tag = f"{basket['basket_id']} trade #{entry['trade_no']} (contract {entry['contract_id']})"
+        lines = [
+            f"\n[FLIP FLOP DEVIL] COUNTERFACTUAL TRADE RECORDED | {tag}"
+            f"{' | ASSUMED LOSS' if assumed else ''}",
+            f"   Engine requested: INVERTED {_yn(requested)} | Watchdog executed: "
+            f"INVERTED {_yn(inverted)} ({entry['executed_signal']})",
+            f"   Actual:    INVERTED {_yn(inverted)} -> {actual_outcome}",
+            f"   Projected: INVERTED {_yn(requested)} -> {projected_outcome} "
+            f"(observational only, not in P&L / virtual win rate)",
+            f"   Threshold {_pct_text(before['threshold'])} -> "
+            f"{_pct_text(self.active_threshold)} | Virtual win rate "
+            f"{_fmt_rate(before['rate'])} -> {_fmt_rate(self.virtual_rate_pct())} | "
+            f"real loss streak {self.threshold_loss_streak}",
+        ]
+
+        if projected_won:
+            entry["level"] = basket["level"]
+            self.ffd_emit(lines)
+            self.ffd_emit(None, {"event": "TRADE_RESOLVED", "basket_id": basket["basket_id"],
+                                 "entry": entry, "basket_stats": basket["stats"]})
+            self.ffd_close_basket(basket, entry)
+            return
+
+        # projected LOSS: the basket stays active; evaluate Level 3
+        next_requested = self.decide_inversion()
+        continues = next_requested == requested
+        entry["engine_next_decision"] = next_requested
+        entry["engine_continues_pattern"] = continues
+        level3_new = False
+        if continues and not basket["level3_confirmed"]:
+            basket["level3_confirmed"] = True
+            basket["level3_confirmed_at_trade"] = entry["trade_no"]
+            basket["level"] = 3
+            level3_new = True
+        entry["level"] = basket["level"]
+
+        lines.append(
+            f"   Normal engine decision for the next signal: INVERTED {_yn(next_requested)} "
+            f"-> {'STILL requests' if continues else 'no longer requests'} the suppressed "
+            f"mode (INVERTED {_yn(requested)})"
+        )
+        if level3_new:
+            lines.append(
+                f"[FLIP FLOP DEVIL] LEVEL 3 CONFIRMED | {basket['basket_id']} | intervention "
+                f"interrupted the pattern while the engine still favours INVERTED "
+                f"{_yn(requested)}"
+            )
+        else:
+            lines.append(
+                f"   Level 3: {'confirmed earlier' if basket['level3_confirmed'] else 'not confirmed yet'}"
+            )
+        lines.append(f"   Basket: {self.ffd_stats_text(basket)}")
+        lines.append(
+            f"   Watchdog remains ACTIVE (projected {projected_outcome}: devil not defeated yet)"
+        )
+        self.ffd_emit(lines)
+        self.ffd_emit(None, {"event": "TRADE_RESOLVED", "basket_id": basket["basket_id"],
+                             "entry": entry, "basket_stats": basket["stats"]})
+        if level3_new:
+            self.ffd_emit(
+                None,
+                {
+                    "event": "LEVEL_3_CONFIRMED",
+                    "basket_id": basket["basket_id"],
+                    "trade_no": entry["trade_no"],
+                    "contract_id": entry["contract_id"],
+                    "engine_next_decision": next_requested,
+                },
+            )
+
+    def ffd_close_basket(self, basket, entry):
+        """A projected WIN defeats the devil: close the basket, clear the state."""
+        basket["status"] = "CLOSED"
+        basket["closed_at"] = self._iso_now()
+        basket["defeated_devil"] = True
+        basket["defeating_trade"] = entry["trade_no"]
+        entry["defeated_devil"] = True
+        basket["closure_reason"] = (
+            f"projected WIN on rescued trade #{entry['trade_no']} "
+            f"(contract {entry['contract_id']}): engine mode INVERTED "
+            f"{_yn(entry['projected_inversion'])} would have won (actual "
+            f"INVERTED {_yn(entry['executed_inversion'])} -> {entry['actual_outcome']})"
+        )
+        self.ffd_closed_baskets.append(basket)
+        self.ffd_basket = None
+        self.ffd_recent.clear()  # the next event is detected from FRESH history
+        self.ffd_level1_active = None
+        lines = [
+            f"[FLIP FLOP DEVIL] PROJECTED WIN DETECTED | {basket['basket_id']} | rescued trade "
+            f"#{entry['trade_no']} (contract {entry['contract_id']})",
+            f"[FLIP FLOP DEVIL] DEVIL DEFEATED | {basket['closure_reason']}",
+            f"[FLIP FLOP DEVIL] RESCUE BASKET CLOSED | {basket['basket_id']} | "
+            f"{self.ffd_stats_text(basket)}",
+            f"   Total rescued trades: {basket['stats']['total_rescued']} | total projected "
+            f"losses avoided: {basket['stats']['projected_losses_avoided']}",
+            "[FLIP FLOP DEVIL] WATCHDOG DEACTIVATED | the normal inversion engine resumes "
+            f"control (active threshold {_pct_text(self.active_threshold)}, "
+            f"{len(self.threshold_stack)} outstanding adjustment(s), martingale and P&L untouched)",
+        ]
+        self.ffd_emit(lines, {"event": "BASKET_CLOSED", "basket": basket})
 
     # [SEGMENT] ---------------------------------------------------------
     @staticmethod
@@ -1302,22 +1813,32 @@ class Bot:
                 note = f" | [SKIP] {direction} bias not decisive (N={decided})"
             elif self.busy:
                 note = " | [SKIP] contract still open"
-            elif self.brake_should_skip():  # [BRAKE] SKIP-mode cooldown
-                note = (
-                    f" | [SKIP] loss-streak brake (streak "
-                    f"{self.threshold_loss_streak}, {self.brake_skips_left} more to skip)"
-                )
             else:
-                # [INVERT] decide with the virtual win rate available right now;
-                # SKIP never reaches this branch, so it can never be inverted.
+                # [INVERT] the NORMAL engine decides with the virtual win rate
+                # available right now (locked to "no inversion" during the
+                # [MINTRADES] warm-up); SKIP never reaches this branch, so it
+                # can never be inverted.
                 original_signal = contract_type
-                inverted = original_signal in INVERSE_SIGNAL and self.decide_inversion()
+                requested = original_signal in INVERSE_SIGNAL and self.decide_inversion()
+
+                # [WATCHDOG] captures the engine's request and may override the
+                # EXECUTION mode only (never the signal, threshold or stats).
+                inverted, wd_entry = self.watchdog_decide(
+                    symbol, original_signal, requested
+                )
                 if inverted:
                     contract_type = INVERSE_SIGNAL[original_signal]
 
                 mode = await self.place_order(
-                    symbol, contract_type, st.tick_idx, original_signal, inverted
+                    symbol,
+                    contract_type,
+                    st.tick_idx,
+                    original_signal,
+                    inverted,
+                    requested,
+                    wd_entry,
                 )
+                self.ffd_flush()  # [WATCHDOG] print / persist AFTER the send
 
                 # [LOSSLOG] attach the signal snapshot AFTER the send
                 if LOSS_LOG_ENABLED and self.order is not None:
@@ -1337,6 +1858,8 @@ class Bot:
                     f"step {self.mg_step} | {mode} | {direction}-bias N={decided} | "
                     f"seg {st.segments[direction]}"  # [SEGMENT]
                     f" | orig {original_signal} inv {'YES' if inverted else 'NO'}"  # [INVERT]
+                    f" | engine-req {'YES' if requested else 'NO'} "  # [WATCHDOG]
+                    f"wd {'FORCED' if wd_entry is not None else 'off'}"
                 )
 
             note = (
@@ -1354,7 +1877,14 @@ class Bot:
 
     # --------------------------------------------------------------- orders
     async def place_order(
-        self, symbol, contract_type, signal_idx, original_signal=None, inverted=False
+        self,
+        symbol,
+        contract_type,
+        signal_idx,
+        original_signal=None,
+        inverted=False,
+        requested_inverted=None,
+        wd_entry=None,
     ):
         stake = self.stake
         prop = self.proposals.get((symbol, contract_type)) if USE_PROPOSALS else None
@@ -1387,6 +1917,11 @@ class Bot:
             original_signal if original_signal is not None else contract_type
         )
         self.order.inverted = bool(inverted)
+        # [WATCHDOG] the normal engine's own request + the basket entry, if any
+        self.order.requested_inverted = bool(
+            inverted if requested_inverted is None else requested_inverted
+        )
+        self.order.wd_entry = wd_entry
         await self.send(payload)
         return mode
 
@@ -1439,17 +1974,30 @@ class Bot:
 
         if contract_id is None or order is None:
             print("[!] Buy response did not contain a contract ID.")
-            self.release()
+            self.abort_order("buy response without a contract ID")
             return
 
         order.contract_id = int(contract_id)
 
         # [INVERT] keep the inversion record tied to the contract until it resolves
+        # [WATCHDOG] together with the engine's request and the basket link;
+        # nothing here is ever re-derived from the bot's current state.
+        wd_entry = order.wd_entry
         self.trade_meta[order.contract_id] = {
+            "contract_id": order.contract_id,
             "original": order.original_signal,
             "executed": order.contract_type,
             "inverted": order.inverted,
+            "requested_inverted": order.requested_inverted,
+            "watchdog_intervened": wd_entry is not None,
+            "basket_id": wd_entry["basket_id"] if wd_entry is not None else None,
+            "projected_inverted": (
+                order.requested_inverted if wd_entry is not None else None
+            ),
+            "wd_entry": wd_entry,
         }
+        if wd_entry is not None:
+            wd_entry["contract_id"] = order.contract_id
 
         rtt = (time.monotonic() - order.t_sent) * 1000
         balance = info.get("balance_after")
@@ -1572,8 +2120,9 @@ class Bot:
         # [INVERT] an assumed loss is treated as a loss everywhere else, so it
         # is counted once here too (the late result is ignored by on_late_poc).
         # [THRESHOLD] the same single call also feeds the threshold detector.
+        # [MINTRADES] / [WATCHDOG] and the resolved-trade counter / watchdog.
         meta = self.trade_meta.pop(contract_id, None)
-        self.record_inversion_result(meta, "lost")
+        self.record_inversion_result(meta, "lost", assumed=True)
 
         print(
             f"\n[!] ASSUMED LOSS | Contract {contract_id} still unresolved "
@@ -1610,6 +2159,7 @@ class Bot:
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
         print("==========================================")
         self.inversion_report(meta, "lost", contract_id)  # [INVERT]
+        self.ffd_flush()  # [WATCHDOG]
         print()
 
         self.release()
@@ -1738,6 +2288,8 @@ class Bot:
         # [THRESHOLD] the same call feeds the threshold detector, using the
         # trade's own stored `inverted` flag.  The contract is already in
         # `resolved`, so a repeated event never gets here.
+        # [MINTRADES] / [WATCHDOG] the same single call counts the resolved
+        # trade and feeds the Flip Flop Devil watchdog.
         meta = self.trade_meta.pop(contract_id, None)
         self.record_inversion_result(meta, status)
 
@@ -1791,6 +2343,7 @@ class Bot:
         print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
         print("==========================================")
         self.inversion_report(meta, status, contract_id)  # [INVERT]
+        self.ffd_flush()  # [WATCHDOG]
         print()
 
         if self.net_pl >= TARGET_PL:
@@ -1821,7 +2374,7 @@ class Bot:
         if data.get("req_id") == REQ_BUY and (
             self.order is None or self.order.contract_id is None
         ):
-            self.release()
+            self.abort_order("buy rejected by the API")
 
     # ------------------------------------------------------------ connection
     async def heartbeat(self):
@@ -1843,7 +2396,8 @@ class Bot:
             # A contract was open when we dropped: re-attach to its result.
             await self.subscribe_contract(order.contract_id)
         else:
-            self.release()  # unknown fate of an in-flight buy; unblock trading
+            # unknown fate of an in-flight buy; unblock trading
+            self.abort_order("connection lost before the buy was confirmed")
 
         await self.send({"ticks": SYMBOLS, "subscribe": 1, "req_id": REQ_TICKS})
         if USE_PROPOSALS:
@@ -1910,12 +2464,21 @@ class Bot:
                         f"ACTIVE_THRESHOLD={_pct_text(self.active_threshold)} "
                         f"(outstanding adjustments: {len(self.threshold_stack)})"
                     )
-                    print(  # [BRAKE]
-                        f"LOSS_STREAK_BRAKE={LOSS_STREAK_BRAKE_ENABLED} | "
-                        f"AFTER={LOSS_STREAK_BRAKE_AFTER} | "
-                        f"ACTION={LOSS_STREAK_BRAKE_ACTION} | "
-                        f"HOLD_MARGIN={LOSS_STREAK_BRAKE_HOLD_MARGIN:g} | "
-                        f"SKIP_SIGNALS={LOSS_STREAK_BRAKE_SKIP_SIGNALS}"
+                    print(  # [MINTRADES]
+                        f"INVERSION_MIN_RESOLVED_TRADES={INVERSION_MIN_RESOLVED_TRADES} "
+                        f"(resolved so far: {self.resolved_trade_count})"
+                    )
+                    print(  # [WATCHDOG]
+                        f"FLIP_FLOP_DEVIL={FLIP_FLOP_DEVIL_ENABLED} | "
+                        f"MARGIN={FLIP_FLOP_DEVIL_MARGIN:g} pts | "
+                        f"LOG={FLIP_FLOP_DEVIL_LOG_ENABLED} | "
+                        f"LOG_FILE={FLIP_FLOP_DEVIL_LOG_FILE} | "
+                        f"closed baskets: {len(self.ffd_closed_baskets)}"
+                        + (
+                            f" | ACTIVE basket {self.ffd_basket['basket_id']}"
+                            if self.ffd_basket is not None
+                            else ""
+                        )
                     )
                     print(  # [ROLLING]
                         f"VIRTUAL_WIN_RATE_MODE={VIRTUAL_WIN_RATE_MODE}"
