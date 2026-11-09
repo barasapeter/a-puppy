@@ -157,6 +157,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from statistics import median_low
+import sys
 
 import websockets
 
@@ -190,7 +191,7 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 20  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 1  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
@@ -2400,6 +2401,12 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
+        if (
+            err.get("message", err)
+            == "Your account balance is insufficient to buy this contract."
+        ):
+            print("Account blown 💀. Exiting gracefully...")
+            sys.exit(0)
         if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
             order = self.order
             if order is not None and order.query_outstanding:
