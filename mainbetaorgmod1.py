@@ -171,7 +171,7 @@ AUTO_LOOKAHEAD = False  # tune LOOKAHEAD from measured entry lag
 MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
-MIN_SAMPLES = 1  # min decided samples in the current direction's bucket
+MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
 MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
@@ -185,8 +185,8 @@ PRINT_TICKS = True
 
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
-MAX_MARTINGALE_STEPS = 5
-MAX_STAKE = 70.0
+MAX_MARTINGALE_STEPS = 8
+MAX_STAKE = 120.0
 TARGET_PL = 15.0
 
 # [TIMEOUT] unresolved-contract watchdog
@@ -217,9 +217,13 @@ INVERSION_THRESHOLD = 46.0
 INVERSION_MIN_SAMPLES = 10
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
-THRESHOLD_ALPHA = 0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
+THRESHOLD_ALPHA = (
+    0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
+)
 THRESHOLD_MARGIN = 1.0  # percentage points, >= 0
-THRESHOLD_MAX_STEP_WEIGHT = 0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
+THRESHOLD_MAX_STEP_WEIGHT = (
+    0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
+)
 THRESHOLD_P_FLOOR = 0.05  # lower clamp of the virtual win rate fraction
 THRESHOLD_P_CEIL = 0.95  # upper clamp of the virtual win rate fraction
 THRESHOLD_MIN = 20.0  # wide safety rail: the active threshold never goes below this
@@ -411,7 +415,10 @@ def validate_threshold_config():
             f"INVERSION_MIN_SAMPLES must be a non-negative integer, "
             f"got {INVERSION_MIN_SAMPLES!r}"
         )
-    if VIRTUAL_WIN_RATE_MODE == "WINDOW" and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW:
+    if (
+        VIRTUAL_WIN_RATE_MODE == "WINDOW"
+        and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW
+    ):
         raise ValueError(
             f"INVERSION_MIN_SAMPLES ({INVERSION_MIN_SAMPLES}) cannot exceed "
             f"VIRTUAL_WIN_RATE_WINDOW ({VIRTUAL_WIN_RATE_WINDOW}) in WINDOW mode"
@@ -555,7 +562,9 @@ class Bot:
         #   {"inverted": bool, "weight": float, "position": n, "seq": resolution no.}
         self.threshold_stack = []
         self.threshold_loss_streak = 0  # consecutive REAL losses (feeds the brake)
-        self.threshold_resolutions = 0  # resolved trades seen by the detector (entry age)
+        self.threshold_resolutions = (
+            0  # resolved trades seen by the detector (entry age)
+        )
         self.last_threshold_change = None  # description of the latest movement
 
         # [BRAKE] last resolved trade's inversion mode and SKIP-mode cooldown
@@ -1751,7 +1760,9 @@ class Bot:
         self.basket += reached
         self.target_hits += 1
         self.net_pl = 0.0
-        print(f"\nProfit target reached: +{reached:.2f} USD (target: {TARGET_PL:.2f} USD).")
+        print(
+            f"\nProfit target reached: +{reached:.2f} USD (target: {TARGET_PL:.2f} USD)."
+        )
         print(f"Session basket: {self.basket:.2f} USD.")
         print("Stopping bot. No further trades will be opened.")
         raise SystemExit(0)
@@ -1923,7 +1934,10 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
-        if err.get('message', err) == "Your account balance is insufficient to buy this contract.":
+        if (
+            err.get("message", err)
+            == "Your account balance is insufficient to buy this contract."
+        ):
             print("Account blown 💀. Exiting gracefully...")
             sys.exit(0)
         if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
