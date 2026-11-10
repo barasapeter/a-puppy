@@ -246,7 +246,7 @@ INVERSION_MIN_RESOLVED_TRADES = 4
 # [WATCHDOG] Flip Flop Devil watchdog (replaces the old loss-streak brake)
 FLIP_FLOP_DEVIL_ENABLED = True
 FLIP_FLOP_DEVIL_MARGIN = 3.0  # Level 1 flag only: SMALL if |virtual win rate - threshold| <= this (pts); never gates
-FLIP_FLOP_DEVIL_LOG_ENABLED = True
+FLIP_FLOP_DEVIL_LOG_ENABLED = False
 FLIP_FLOP_DEVIL_LOG_FILE = "flip_flop_devil_events.json"  # JSON array of events
 
 # [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is

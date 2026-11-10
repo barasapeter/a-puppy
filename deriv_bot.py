@@ -226,7 +226,7 @@ SIGNAL_MIN_Z = 0.5 #1.0
 THRESHOLD_ALPHA = (
     0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
 )
-THRESHOLD_MARGIN = 0.5 #1.0  # percentage points, >= 0
+THRESHOLD_MARGIN = 1.5 #1.0  # percentage points, >= 0
 THRESHOLD_MAX_STEP_WEIGHT = (
     0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
 )
