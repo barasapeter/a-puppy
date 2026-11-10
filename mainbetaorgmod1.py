@@ -1717,6 +1717,7 @@ class Bot:
         self.inversion_report(meta, "lost", contract_id)  # [INVERT]
         print()
 
+        self.stop_if_target_reached()
         self.release()
 
         if USE_PROPOSALS and self.stake != old_stake:
@@ -1740,6 +1741,20 @@ class Bot:
         need = max(0.0, -self.net_pl) + self.stake
         if need > self.min_bankroll:
             self.min_bankroll = need
+
+    def stop_if_target_reached(self):
+        """Stop the bot once cumulative session net P&L reaches the target."""
+        if self.net_pl < TARGET_PL:
+            return False
+
+        reached = self.net_pl
+        self.basket += reached
+        self.target_hits += 1
+        self.net_pl = 0.0
+        print(f"\nProfit target reached: +{reached:.2f} USD (target: {TARGET_PL:.2f} USD).")
+        print(f"Session basket: {self.basket:.2f} USD.")
+        print("Stopping bot. No further trades will be opened.")
+        raise SystemExit(0)
 
     def apply_result(self, status, profit):
         """Update P&L and martingale state. Returns an info message."""
@@ -1898,13 +1913,7 @@ class Bot:
         self.inversion_report(meta, status, contract_id)  # [INVERT]
         print()
 
-        if self.net_pl >= TARGET_PL:
-            self.basket += self.net_pl
-            self.target_hits += 1
-            self.net_pl = 0.0
-            print("Net PL has been reset.")
-            sys.exit(0)
-            print("💎🏆💎Target profit reached, stopping process.")
+        self.stop_if_target_reached()
 
         self.release()
 

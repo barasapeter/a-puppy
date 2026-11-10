@@ -2203,6 +2203,7 @@ class Bot:
         self.ffd_flush()  # [WATCHDOG]
         print()
 
+        self.stop_if_target_reached()
         self.release()
 
         if USE_PROPOSALS and self.stake != old_stake:
@@ -2226,6 +2227,15 @@ class Bot:
         need = max(0.0, -self.net_pl) + self.stake
         if need > self.min_bankroll:
             self.min_bankroll = need
+
+    def stop_if_target_reached(self):
+        if self.net_pl >= TARGET_PL:
+            self.basket += self.net_pl
+            self.target_hits += 1
+            self.net_pl = 0.0
+            print("Net PL has been reset.")
+            print("💎🏆💎Target profit reached, stopping process.")
+            raise SystemExit(0)
 
     def apply_result(self, status, profit):
         """Update P&L and martingale state. Returns an info message."""
@@ -2387,14 +2397,7 @@ class Bot:
         self.ffd_flush()  # [WATCHDOG]
         print()
 
-        if self.net_pl >= TARGET_PL:
-            self.basket += self.net_pl
-            self.target_hits += 1
-            self.net_pl = 0.0
-            print("Net PL has been reset.")
-            sys.exit(0)
-            print("Target profit reached, exiting...")
-
+        self.stop_if_target_reached()
         self.release()
 
         if USE_PROPOSALS and self.stake != old_stake:

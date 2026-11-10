@@ -34,6 +34,11 @@ Key ideas
   doubling then continues from that stake on losses; a win that leaves the net
   P&L >= 0 resets everything to BASE_STAKE.
 
+* [TARGET] STOP ON TARGET: when STOP_ON_TARGET is True the bot exits cleanly
+  as soon as the net P&L reaches TARGET_PL (after the winning trade's report
+  has been printed).  With STOP_ON_TARGET False the net P&L is reset and the
+  bot keeps trading (old behaviour).
+
 * [TIMEOUT] If a confirmed contract is still unresolved UNRESOLVED_TIMEOUT_TICKS
   ticks after its buy confirmation, the circuit stays locked (busy) and the bot
   asks the server for the contract's real status (one-shot proposal_open_contract),
@@ -188,6 +193,9 @@ MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 5
 MAX_STAKE = 70.0
 TARGET_PL = 15.0
+# [TARGET] True = exit the bot as soon as net P&L >= TARGET_PL
+# False = reset net P&L and keep trading (old behaviour)
+STOP_ON_TARGET = True
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
@@ -220,13 +228,13 @@ INVERSION_MIN_SAMPLES = 5
 #     z = |continuation - reversal| / sqrt(continuation + reversal)
 # MIN_EDGE alone passes ~55/45 splits at N~40 (z ~ 0.6), which is pure noise.
 # 0 = off (old behaviour).
-SIGNAL_MIN_Z = 0.5 #1.0
+SIGNAL_MIN_Z = 0.5  # 1.0
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
 THRESHOLD_ALPHA = (
     0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
 )
-THRESHOLD_MARGIN = 1.5 #1.0  # percentage points, >= 0
+THRESHOLD_MARGIN = 1.5  # 1.0  # percentage points, >= 0
 THRESHOLD_MAX_STEP_WEIGHT = (
     0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
 )
@@ -1955,6 +1963,20 @@ class Bot:
         if self.net_pl >= TARGET_PL:
             self.basket += self.net_pl
             self.target_hits += 1
+
+            # [TARGET] stop as soon as the target profit is reached.  The winning
+            # contract has just resolved, so nothing is left open.  SystemExit is
+            # not caught by run()'s `except Exception`, so the bot will not
+            # reconnect; the websocket context manager closes the connection.
+            if STOP_ON_TARGET:
+                self.release()
+                print(
+                    f"\n🎯 TARGET REACHED | Net P&L {self.net_pl:+.2f} USD "
+                    f">= {TARGET_PL:.2f} USD | Trades: {self.wins}W {self.losses}L | "
+                    f"Stopping bot."
+                )
+                sys.exit(0)
+
             self.net_pl = 0.0
             print("Net PL has been reset.")
 
@@ -2048,6 +2070,9 @@ class Bot:
                         f"LOOKAHEAD={self.lookahead} (auto={AUTO_LOOKAHEAD}) | "
                         f"PROPOSALS={USE_PROPOSALS} | "
                         f"MIN_SAMPLES={MIN_SAMPLES} | MIN_EDGE={MIN_EDGE}"
+                    )
+                    print(  # [TARGET]
+                        f"TARGET_PL={TARGET_PL:.2f} | STOP_ON_TARGET={STOP_ON_TARGET}"
                     )
                     print(  # [SEGMENT]
                         f"SEGMENTS={SEGMENT_ENABLED} | "
