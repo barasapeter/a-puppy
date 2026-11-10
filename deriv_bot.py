@@ -214,18 +214,22 @@ INVERSION_THRESHOLD = 46.0
 # threshold test degenerates into "did the original signal win last time?" and
 # the bot alternates normal / inverted on every trade (see the 8-loss opening
 # streak).  0 = no warm-up (old behaviour).
-INVERSION_MIN_SAMPLES = 10
+INVERSION_MIN_SAMPLES = 5
 # [SIGNAL] a PUT/CALL signal is only traded when its direction's bias is
 # statistically distinguishable from a coin flip:
 #     z = |continuation - reversal| / sqrt(continuation + reversal)
 # MIN_EDGE alone passes ~55/45 splits at N~40 (z ~ 0.6), which is pure noise.
 # 0 = off (old behaviour).
-SIGNAL_MIN_Z = 1.0
+SIGNAL_MIN_Z = 0.5 #1.0
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
-THRESHOLD_ALPHA = 0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
-THRESHOLD_MARGIN = 1.0  # percentage points, >= 0
-THRESHOLD_MAX_STEP_WEIGHT = 0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
+THRESHOLD_ALPHA = (
+    0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
+)
+THRESHOLD_MARGIN = 0.5 #1.0  # percentage points, >= 0
+THRESHOLD_MAX_STEP_WEIGHT = (
+    0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
+)
 THRESHOLD_P_FLOOR = 0.05  # lower clamp of the virtual win rate fraction
 THRESHOLD_P_CEIL = 0.95  # upper clamp of the virtual win rate fraction
 THRESHOLD_MIN = 20.0  # wide safety rail: the active threshold never goes below this
@@ -423,7 +427,10 @@ def validate_threshold_config():
         or SIGNAL_MIN_Z < 0
     ):
         raise ValueError(f"SIGNAL_MIN_Z must be a number >= 0, got {SIGNAL_MIN_Z!r}")
-    if VIRTUAL_WIN_RATE_MODE == "WINDOW" and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW:
+    if (
+        VIRTUAL_WIN_RATE_MODE == "WINDOW"
+        and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW
+    ):
         raise ValueError(
             f"INVERSION_MIN_SAMPLES ({INVERSION_MIN_SAMPLES}) cannot exceed "
             f"VIRTUAL_WIN_RATE_WINDOW ({VIRTUAL_WIN_RATE_WINDOW}) in WINDOW mode"
@@ -567,7 +574,9 @@ class Bot:
         #   {"inverted": bool, "weight": float, "position": n, "seq": resolution no.}
         self.threshold_stack = []
         self.threshold_loss_streak = 0  # consecutive REAL losses (feeds the brake)
-        self.threshold_resolutions = 0  # resolved trades seen by the detector (entry age)
+        self.threshold_resolutions = (
+            0  # resolved trades seen by the detector (entry age)
+        )
         self.last_threshold_change = None  # description of the latest movement
 
         # [BRAKE] last resolved trade's inversion mode and SKIP-mode cooldown
@@ -1430,9 +1439,7 @@ class Bot:
             # [SIGNAL] a bias indistinguishable from a coin flip is not traded
             bias_z = self.bias_z(bucket)
             weak = (
-                contract_type != "SKIP"
-                and SIGNAL_MIN_Z > 0
-                and bias_z < SIGNAL_MIN_Z
+                contract_type != "SKIP" and SIGNAL_MIN_Z > 0 and bias_z < SIGNAL_MIN_Z
             )
 
             # ---- hot path: send BEFORE any printing ----
@@ -1959,7 +1966,10 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
-        if err.get('message', err) == "Your account balance is insufficient to buy this contract.":
+        if (
+            err.get("message", err)
+            == "Your account balance is insufficient to buy this contract."
+        ):
             print("Account blown 💀. Exiting gracefully...")
             sys.exit(0)
         if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
