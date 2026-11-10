@@ -100,6 +100,10 @@ Key ideas
       N <  0 : thr = baseline - (baseline - T_dn) * |N|
       active = clamp(thr, THRESHOLD_MIN, THRESHOLD_MAX); empty stack = baseline.
 
+  Stack entries expire after THRESHOLD_ENTRY_TTL resolved trades, and
+  [WARMUP] inversion cannot turn ON before INVERSION_MIN_SAMPLES virtual
+  outcomes exist.
+
   The direction comes from the trade's own stored `inverted` flag
   (trade_meta), never from the bot's current inversion state.  The detector
   runs inside record_inversion_result, i.e. through the one existing
@@ -205,20 +209,27 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # (percent).  This is the permanent BASELINE; the threshold actually used is
 # the ACTIVE threshold, adjusted by the [THRESHOLD] detector below.
 INVERSION_THRESHOLD = 46.0
+# [WARMUP] inversion can only turn ON once this many virtual outcomes exist.  With
+# 1-9 samples the virtual win rate jumps 10-50 points per trade, so the
+# threshold test degenerates into "did the original signal win last time?" and
+# the bot alternates normal / inverted on every trade (see the 8-loss opening
+# streak).  0 = no warm-up (old behaviour).
+INVERSION_MIN_SAMPLES = 10
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
-THRESHOLD_ALPHA = (
-    0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
-)
+THRESHOLD_ALPHA = 0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
 THRESHOLD_MARGIN = 1.0  # percentage points, >= 0
-THRESHOLD_MAX_STEP_WEIGHT = (
-    0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
-)
+THRESHOLD_MAX_STEP_WEIGHT = 0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
 THRESHOLD_P_FLOOR = 0.05  # lower clamp of the virtual win rate fraction
 THRESHOLD_P_CEIL = 0.95  # upper clamp of the virtual win rate fraction
 THRESHOLD_MIN = 20.0  # wide safety rail: the active threshold never goes below this
 THRESHOLD_MAX = 90.0  # wide safety rail: the active threshold never goes above this
 THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
+# Stack entries older than this many RESOLVED trades are dropped.  Without it an
+# entry of one type (e.g. inverted losses from an early phase) is only removed by
+# a win of the same type, which may never come, and its weight cancels every
+# later push of the opposite type forever (detector stays pinned at baseline).
+THRESHOLD_ENTRY_TTL = 10
 
 # [BRAKE] loss-streak brake (stops the normal <-> inverted flip-flop in a streak)
 LOSS_STREAK_BRAKE_ENABLED = False
@@ -382,6 +393,29 @@ def validate_threshold_config():
             f"THRESHOLD_PRECISION must be a non-negative integer, "
             f"got {THRESHOLD_PRECISION!r}"
         )
+    if (
+        isinstance(THRESHOLD_ENTRY_TTL, bool)
+        or not isinstance(THRESHOLD_ENTRY_TTL, int)
+        or THRESHOLD_ENTRY_TTL <= 0
+    ):
+        raise ValueError(
+            f"THRESHOLD_ENTRY_TTL must be a positive integer, "
+            f"got {THRESHOLD_ENTRY_TTL!r}"
+        )
+    if (
+        isinstance(INVERSION_MIN_SAMPLES, bool)
+        or not isinstance(INVERSION_MIN_SAMPLES, int)
+        or INVERSION_MIN_SAMPLES < 0
+    ):
+        raise ValueError(
+            f"INVERSION_MIN_SAMPLES must be a non-negative integer, "
+            f"got {INVERSION_MIN_SAMPLES!r}"
+        )
+    if VIRTUAL_WIN_RATE_MODE == "WINDOW" and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW:
+        raise ValueError(
+            f"INVERSION_MIN_SAMPLES ({INVERSION_MIN_SAMPLES}) cannot exceed "
+            f"VIRTUAL_WIN_RATE_WINDOW ({VIRTUAL_WIN_RATE_WINDOW}) in WINDOW mode"
+        )
 
 
 validate_threshold_config()
@@ -518,9 +552,10 @@ class Bot:
         self.baseline_threshold = _round_pct(INVERSION_THRESHOLD)
         self.active_threshold = self.baseline_threshold
         # LIFO stack of outstanding loss entries; each entry:
-        #   {"inverted": bool, "weight": float, "position": n}
+        #   {"inverted": bool, "weight": float, "position": n, "seq": resolution no.}
         self.threshold_stack = []
         self.threshold_loss_streak = 0  # consecutive REAL losses (feeds the brake)
+        self.threshold_resolutions = 0  # resolved trades seen by the detector (entry age)
         self.last_threshold_change = None  # description of the latest movement
 
         # [BRAKE] last resolved trade's inversion mode and SKIP-mode cooldown
@@ -559,6 +594,11 @@ class Bot:
         return f"SESSION BIAS | {symbol} | " + "  ||  ".join(parts)
 
     # [INVERT] ----------------------------------------------------------
+    def inversion_warming_up(self):
+        """[WARMUP] True while there are too few virtual outcomes to trust the rate."""
+        total = self.active_virtual_wins + self.active_virtual_losses
+        return total < INVERSION_MIN_SAMPLES
+
     def inversion_active(self):
         """
         Inversion decision, based EXCLUSIVELY on the virtual win rate:
@@ -569,7 +609,7 @@ class Bot:
         """
         # [ROLLING] uses the ACTIVE counters (window or all), never the lifetime ones
         total = self.active_virtual_wins + self.active_virtual_losses
-        if not total:
+        if not total or self.inversion_warming_up():  # [WARMUP]
             return False
         # [THRESHOLD] the dynamically adjusted threshold, not the baseline
         return self.active_virtual_wins * 100 <= self.active_threshold * total
@@ -613,6 +653,8 @@ class Bot:
         while the HOLD brake is engaged AND the evidence is ambiguous: then the
         last trade's mode is kept.
         """
+        if self.inversion_warming_up():  # [WARMUP]
+            return False
         if self.brake_holds():
             return self.last_trade_inverted
         return self.inversion_active()
@@ -740,6 +782,14 @@ class Bot:
         the current virtual win rate.
         """
         inverted = bool(inverted)
+
+        # drop stale evidence first (entries older than THRESHOLD_ENTRY_TTL trades)
+        self.threshold_resolutions += 1
+        self.threshold_stack = [
+            e
+            for e in self.threshold_stack
+            if self.threshold_resolutions - e["seq"] < THRESHOLD_ENTRY_TTL
+        ]
         before = self.active_threshold
 
         if won:
@@ -786,6 +836,7 @@ class Bot:
                 "inverted": inverted,
                 "weight": weight,
                 "position": position,
+                "seq": self.threshold_resolutions,
             }
         )
         self.active_threshold = self.compute_active_threshold()
@@ -895,6 +946,11 @@ class Bot:
             inv_reason = (
                 f"held by brake; threshold rule says {rule_state} "
                 f"at <= {_pct_text(self.active_threshold)}"
+            )
+        elif self.inversion_warming_up():  # [WARMUP]
+            inv_reason = (
+                f"warm-up: {len(self.virtual_history)}/{INVERSION_MIN_SAMPLES} "
+                f"virtual samples needed"
             )
         else:
             inv_reason = f"threshold <= {_pct_text(self.active_threshold)}"
@@ -1856,10 +1912,7 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
-        if (
-            err.get("message", err)
-            == "Your account balance is insufficient to buy this contract."
-        ):
+        if err.get('message', err) == "Your account balance is insufficient to buy this contract.":
             print("Account blown 💀. Exiting gracefully...")
             sys.exit(0)
         if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
@@ -1963,6 +2016,8 @@ class Bot:
                         f"THRESHOLD_MAX_STEP_WEIGHT={THRESHOLD_MAX_STEP_WEIGHT} | "
                         f"THRESHOLD_P_FLOOR={THRESHOLD_P_FLOOR} | "
                         f"THRESHOLD_P_CEIL={THRESHOLD_P_CEIL} | "
+                        f"THRESHOLD_ENTRY_TTL={THRESHOLD_ENTRY_TTL} | "
+                        f"INVERSION_MIN_SAMPLES={INVERSION_MIN_SAMPLES} | "
                         f"THRESHOLD_MIN={THRESHOLD_MIN} | THRESHOLD_MAX={THRESHOLD_MAX} | "
                         f"ACTIVE_THRESHOLD={_pct_text(self.active_threshold)} "
                         f"(outstanding adjustments: {len(self.threshold_stack)})"
