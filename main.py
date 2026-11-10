@@ -1615,7 +1615,7 @@ class Bot:
             self.net_pl = 0.0
             print("Net PL has been reset.")
             sys.exit(0)
-            print("Target profit reached, exiting...")
+            print("💎🏆💎Target profit reached, stopping process.")
 
         self.release()
 

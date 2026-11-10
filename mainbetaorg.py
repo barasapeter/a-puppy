@@ -1800,8 +1800,7 @@ class Bot:
             self.net_pl = 0.0
             print("Net PL has been reset.")
             sys.exit(0)
-            print("Target profit reached, exiting...")
-            
+            print("💎🏆💎Target profit reached, stopping process.")
 
         self.release()
 
@@ -1811,7 +1810,10 @@ class Bot:
     def on_error(self, data):
         err = data["error"]
         print(f"\n[!] API error response: {err.get('message', err)}")
-        if err.get('message', err) == "Your account balance is insufficient to buy this contract.":
+        if (
+            err.get("message", err)
+            == "Your account balance is insufficient to buy this contract."
+        ):
             print("Account blown 💀. Exiting gracefully...")
             sys.exit(0)
         if data.get("req_id") == REQ_POC_QUERY:  # [TIMEOUT]
