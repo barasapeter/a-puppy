@@ -189,8 +189,6 @@ MAX_MARTINGALE_STEPS = 8
 MAX_STAKE = 120.0
 TARGET_PL = 15.0
 
-STOP_ON_TARGET = False
-
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
 STATUS_QUERY_ENABLED = True  # ask the server for the real contract status first
@@ -216,7 +214,7 @@ INVERSION_THRESHOLD = 46.0
 # threshold test degenerates into "did the original signal win last time?" and
 # the bot alternates normal / inverted on every trade (see the 8-loss opening
 # streak).  0 = no warm-up (old behaviour).
-INVERSION_MIN_SAMPLES = 5
+INVERSION_MIN_SAMPLES = 10
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
 THRESHOLD_ALPHA = (
@@ -610,18 +608,20 @@ class Bot:
         total = self.active_virtual_wins + self.active_virtual_losses
         return total < INVERSION_MIN_SAMPLES
 
-    
     def inversion_active(self):
+        """
+        Inversion decision, based EXCLUSIVELY on the virtual win rate:
+        ON when virtual win rate <= ACTIVE threshold (inclusive), OFF above.
+        With no virtual trades yet there is no rate: inversion stays OFF.
+        Integer-weighted cross-multiplication avoids float rounding at the
+        threshold boundary.
+        """
+        # [ROLLING] uses the ACTIVE counters (window or all), never the lifetime ones
         total = self.active_virtual_wins + self.active_virtual_losses
-
-        if not total or self.inversion_warming_up():
+        if not total or self.inversion_warming_up():  # [WARMUP]
             return False
-
-        virtual_win_rate = (self.active_virtual_wins / total) * 100
-        difference = abs(virtual_win_rate - self.active_threshold)
-
-        return difference > 2.3
-
+        # [THRESHOLD] the dynamically adjusted threshold, not the baseline
+        return self.active_virtual_wins * 100 <= self.active_threshold * total
 
     # [BRAKE] -----------------------------------------------------------
     def brake_active(self):
@@ -1751,11 +1751,8 @@ class Bot:
         if need > self.min_bankroll:
             self.min_bankroll = need
 
-    
     def stop_if_target_reached(self):
-        if not STOP_ON_TARGET:
-            return False
-
+        """Stop the bot once cumulative session net P&L reaches the target."""
         if self.net_pl < TARGET_PL:
             return False
 
@@ -1769,7 +1766,6 @@ class Bot:
         print(f"Session basket: {self.basket:.2f} USD.")
         print("Stopping bot. No further trades will be opened.")
         raise SystemExit(0)
-
 
     def apply_result(self, status, profit):
         """Update P&L and martingale state. Returns an info message."""
