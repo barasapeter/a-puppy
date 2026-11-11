@@ -189,6 +189,8 @@ MAX_MARTINGALE_STEPS = 8
 MAX_STAKE = 120.0
 TARGET_PL = 15.0
 
+STOP_ON_TARGET = False
+
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
 STATUS_QUERY_ENABLED = True  # ask the server for the real contract status first
@@ -1749,8 +1751,11 @@ class Bot:
         if need > self.min_bankroll:
             self.min_bankroll = need
 
+    
     def stop_if_target_reached(self):
-        """Stop the bot once cumulative session net P&L reaches the target."""
+        if not STOP_ON_TARGET:
+            return False
+
         if self.net_pl < TARGET_PL:
             return False
 
@@ -1764,6 +1769,7 @@ class Bot:
         print(f"Session basket: {self.basket:.2f} USD.")
         print("Stopping bot. No further trades will be opened.")
         raise SystemExit(0)
+
 
     def apply_result(self, status, profit):
         """Update P&L and martingale state. Returns an info message."""
