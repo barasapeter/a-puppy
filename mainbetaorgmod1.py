@@ -214,7 +214,7 @@ INVERSION_THRESHOLD = 46.0
 # threshold test degenerates into "did the original signal win last time?" and
 # the bot alternates normal / inverted on every trade (see the 8-loss opening
 # streak).  0 = no warm-up (old behaviour).
-INVERSION_MIN_SAMPLES = 10
+INVERSION_MIN_SAMPLES = 5
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
 THRESHOLD_ALPHA = (
@@ -608,20 +608,18 @@ class Bot:
         total = self.active_virtual_wins + self.active_virtual_losses
         return total < INVERSION_MIN_SAMPLES
 
+    
     def inversion_active(self):
-        """
-        Inversion decision, based EXCLUSIVELY on the virtual win rate:
-        ON when virtual win rate <= ACTIVE threshold (inclusive), OFF above.
-        With no virtual trades yet there is no rate: inversion stays OFF.
-        Integer-weighted cross-multiplication avoids float rounding at the
-        threshold boundary.
-        """
-        # [ROLLING] uses the ACTIVE counters (window or all), never the lifetime ones
         total = self.active_virtual_wins + self.active_virtual_losses
-        if not total or self.inversion_warming_up():  # [WARMUP]
+
+        if not total or self.inversion_warming_up():
             return False
-        # [THRESHOLD] the dynamically adjusted threshold, not the baseline
-        return self.active_virtual_wins * 100 <= self.active_threshold * total
+
+        virtual_win_rate = (self.active_virtual_wins / total) * 100
+        difference = abs(virtual_win_rate - self.active_threshold)
+
+        return difference > 2.3
+
 
     # [BRAKE] -----------------------------------------------------------
     def brake_active(self):
