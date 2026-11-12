@@ -209,6 +209,9 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # (percent).  This is the permanent BASELINE; the threshold actually used is
 # the ACTIVE threshold, adjusted by the [THRESHOLD] detector below.
 INVERSION_THRESHOLD = 46.0
+INVERSION_HYSTERESIS_GAP = (
+    2.2  # percentage-point gap on either side of the active threshold
+)
 # [WARMUP] inversion can only turn ON once this many virtual outcomes exist.  With
 # 1-9 samples the virtual win rate jumps 10-50 points per trade, so the
 # threshold test degenerates into "did the original signal win last time?" and
@@ -416,6 +419,15 @@ def validate_threshold_config():
             f"got {INVERSION_MIN_SAMPLES!r}"
         )
     if (
+        isinstance(INVERSION_HYSTERESIS_GAP, bool)
+        or not isinstance(INVERSION_HYSTERESIS_GAP, (int, float))
+        or INVERSION_HYSTERESIS_GAP < 0
+    ):
+        raise ValueError(
+            f"INVERSION_HYSTERESIS_GAP must be a number >= 0, "
+            f"got {INVERSION_HYSTERESIS_GAP!r}"
+        )
+    if (
         VIRTUAL_WIN_RATE_MODE == "WINDOW"
         and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW
     ):
@@ -558,6 +570,8 @@ class Bot:
         # [THRESHOLD] baseline (never modified) and dynamically adjusted threshold
         self.baseline_threshold = _round_pct(INVERSION_THRESHOLD)
         self.active_threshold = self.baseline_threshold
+        # [INVERT] persistent mode for hysteresis inside the threshold gap
+        self.inversion_mode = False
         # LIFO stack of outstanding loss entries; each entry:
         #   {"inverted": bool, "weight": float, "position": n, "seq": resolution no.}
         self.threshold_stack = []
@@ -658,15 +672,30 @@ class Bot:
 
     def decide_inversion(self):
         """
-        Inversion state for the next order.  The threshold rule decides, except
-        while the HOLD brake is engaged AND the evidence is ambiguous: then the
-        last trade's mode is kept.
+        Inversion state for the next order.
+
+        Hysteresis prevents mode changes near the active threshold:
+        - turn ON at or below threshold - INVERSION_HYSTERESIS_GAP;
+        - turn OFF at or above threshold + INVERSION_HYSTERESIS_GAP;
+        - retain the previous mode inside the gap.
+        The existing warm-up and HOLD-brake rules retain precedence.
         """
         if self.inversion_warming_up():  # [WARMUP]
+            self.inversion_mode = False
             return False
         if self.brake_holds():
-            return self.last_trade_inverted
-        return self.inversion_active()
+            self.inversion_mode = bool(self.last_trade_inverted)
+            return self.inversion_mode
+
+        rate = self.virtual_rate_pct()
+        if rate is None:
+            self.inversion_mode = False
+        elif rate <= self.active_threshold - INVERSION_HYSTERESIS_GAP:
+            self.inversion_mode = True
+        elif rate >= self.active_threshold + INVERSION_HYSTERESIS_GAP:
+            self.inversion_mode = False
+
+        return self.inversion_mode
 
     def brake_should_skip(self):
         """SKIP mode: True (and counts one skipped signal) while cooling down."""
