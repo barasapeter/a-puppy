@@ -187,7 +187,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 8
 MAX_STAKE = 120.0
-TARGET_PL = 15.0
+TARGET_PL = 10000.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
@@ -217,7 +217,7 @@ INVERSION_HYSTERESIS_GAP = (
 # threshold test degenerates into "did the original signal win last time?" and
 # the bot alternates normal / inverted on every trade (see the 8-loss opening
 # streak).  0 = no warm-up (old behaviour).
-INVERSION_MIN_SAMPLES = 10
+INVERSION_MIN_SAMPLES = 5
 
 # [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
 THRESHOLD_ALPHA = (
