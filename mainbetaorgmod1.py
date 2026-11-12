@@ -1,130 +1,23 @@
 """
-Deriv tick-streak bot (optimised rewrite, per-direction bias).
+Deriv tick-streak bot with session-wide adaptive signal inversion.
 
-Key ideas
----------
-* LOOKAHEAD ("virtual streak"): a buy never executes on the signal tick, it
-  executes on the tick that arrives after the server has processed it (usually
-  1-2 ticks later).  So we fire the order *early*, assuming the next
-  LOOKAHEAD ticks continue the streak:
+The original signal-generation, order execution, timeout handling, reporting,
+trade logging, and money-management flow are retained. Adaptive inversion uses
+all resolved virtual outcomes in the current process session. Its hysteresis
+band is the only state-retention rule; there is no warm-up cutoff or rolling
+window.
 
-      virtual streak = real streak + LOOKAHEAD
-      fire when virtual streak >= STREAK
+The active threshold starts at INVERSION_THRESHOLD. Each normal real loss
+raises it by a progressive factor; each inverted real loss lowers it by that
+factor. A real win reverses the latest unreversed loss factor of the same type.
+Every trade event remains in an append-only ledger. Reversals reference prior
+loss events rather than deleting or popping them. The active threshold is
+bounded by THRESHOLD_MIN and THRESHOLD_MAX.
 
-* PER-DIRECTION BIAS: continuation/reversal statistics are kept separately for
-  UP streaks and DOWN streaks.  The trade decision for an UP streak uses only
-  the UP statistics, and for a DOWN streak only the DOWN statistics.
-
-* AUTO_LOOKAHEAD: every resolved contract reports `entry_tick_time`.  We turn
-  that into "ticks between signal and entry" and keep a rolling median, so the
-  look-ahead tunes itself to your real latency.
-
-* The busy flag is set BEFORE the order is sent (no double orders while a buy
-  confirmation is in flight) and is always released on errors / reconnects.
-
-* [SEGMENT] SLIDING STATS SEGMENTS: when a direction's decided samples
-  (continuation + reversal) reach SEGMENT_LIMIT, that direction's stats are
-  rebuilt from only its latest SEGMENT_KEEP decided outcomes and the segment
-  counter goes up.  The stats then grow again by (SEGMENT_LIMIT - SEGMENT_KEEP)
-  new samples until the limit is hit again, and so on.
-
-* [RECOVERY] After a WIN, if the net P&L is still negative (long losing streak
-  and payout < 100%), the next stake is sized so that one more win lifts the
-  net P&L above zero:  stake = deficit / payout_rate + BASE_STAKE.  Martingale
-  doubling then continues from that stake on losses; a win that leaves the net
-  P&L >= 0 resets everything to BASE_STAKE.
-
-* [TIMEOUT] If a confirmed contract is still unresolved UNRESOLVED_TIMEOUT_TICKS
-  ticks after its buy confirmation, the circuit stays locked (busy) and the bot
-  asks the server for the contract's real status (one-shot proposal_open_contract),
-  one query per tick.  A settled answer goes through the normal resolution path
-  (real win/loss, JSON logs included).  Only after QUERY_MAX_FAILURES failed
-  queries (API error, no answer, or still not settled) is the contract treated
-  as an ASSUMED LOSS: it advances P&L / loss streak / martingale like a real
-  loss, URSVD goes up by one, the circuit reopens, and nothing is written to
-  the JSON logs.  A result that arrives afterwards is only reported.
-
-* [LOSSLOG] Every resolved contract is appended as a compact checkpoint report
-  (signal tick, expected execution tick, confirmation / entry tick, direction
-  checks, outcome, and a tick tape from the streak start to the exit).
-  LOST contracts go to LOSS_LOG_FILE, WON contracts to WIN_LOG_FILE (both JSON
-  arrays).  Purely observational.
-
-* [INVERT] ADAPTIVE SIGNAL INVERSION: infer_market_bias still produces the
-  original signal (PUT / CALL / SKIP) exactly as before.  Just before a PUT or
-  CALL is sent, the bot looks at the VIRTUAL win rate (how the ORIGINAL signals
-  would have performed) and decides whether to flip the signal:
-
-      virtual win rate <= ACTIVE threshold  -> inversion ON  (PUT<->CALL)
-      virtual win rate  > ACTIVE threshold  -> inversion OFF
-      no virtual trades yet                 -> inversion OFF
-
-  SKIP is never inverted and never traded.  The inversion state is stored on
-  the order when it is created and never changes.  On resolution each trade
-  updates, exactly once:
-      real wins/losses          - what actually happened
-      virtual wins/losses       - what the original signal would have done
-                                  (outcome reversed for inverted trades)
-      inverted / non-inverted   - actual outcomes split by inversion state
-  The existing cumulative wins/losses and everything else are untouched.
-
-* [ROLLING] The virtual win rate that drives inversion is the ACTIVE virtual
-  win rate, chosen by VIRTUAL_WIN_RATE_MODE:
-      "WINDOW" - only the latest VIRTUAL_WIN_RATE_WINDOW resolved virtual
-                 outcomes (default 12); the oldest one drops out as soon as a
-                 new one arrives
-      "ALL"    - every resolved virtual outcome of the session
-  Lifetime virtual wins/losses are still kept (reporting only) and never drive
-  the inversion decision in WINDOW mode.
-
-* [THRESHOLD] EVIDENCE-WEIGHTED, REVERSIBLE THRESHOLD: INVERSION_THRESHOLD is
-  the permanent BASELINE.  The threshold actually compared with the virtual
-  win rate (VWR) is the ACTIVE threshold, which is recomputed after EVERY
-  resolved contract from a stack of weighted loss entries and the current VWR.
-
-  p = active VWR as a fraction, clamped to [THRESHOLD_P_FLOOR, THRESHOLD_P_CEIL].
-
-  Real LOSS (p = VWR after this trade was recorded):
-      S_TRIG = ln(1 / THRESHOLD_ALPHA)
-      normal trade   : s = -ln(1 - p)      inverted trade : s = -ln(p)
-      w = min(THRESHOLD_MAX_STEP_WEIGHT, s / S_TRIG)
-      push {"inverted", "weight", "position"} on the stack
-  Real WIN: streak resets and the most recent stack entry whose "inverted"
-      flag equals the resolved trade's flag is popped (none -> nothing pops).
-
-  Recompute after every resolution:
-      U = sum of weights of normal entries, D = sum for inverted entries
-      N = clamp(U - D, -1, 1)
-      T_up = max(baseline, VWR% + MARGIN)   T_dn = min(baseline, VWR% - MARGIN)
-      N >= 0 : thr = baseline + (T_up - baseline) * N
-      N <  0 : thr = baseline - (baseline - T_dn) * |N|
-      active = clamp(thr, THRESHOLD_MIN, THRESHOLD_MAX); empty stack = baseline.
-
-  Stack entries expire after THRESHOLD_ENTRY_TTL resolved trades, and
-  [WARMUP] inversion cannot turn ON before INVERSION_MIN_SAMPLES virtual
-  outcomes exist.
-
-  The direction comes from the trade's own stored `inverted` flag
-  (trade_meta), never from the bot's current inversion state.  The detector
-  runs inside record_inversion_result, i.e. through the one existing
-  resolution path, so every resolved contract (normal, status query or
-  assumed loss) affects it exactly once and a late result never does.
-
-* [BRAKE] LOSS-STREAK BRAKE: the threshold feedback can flip the bot between
-  normal and inverted mode after EVERY loss (a normal loss raises the threshold,
-  an inverted loss lowers it), which just alternates sides in a choppy market.
-  Once the consecutive real-loss streak reaches LOSS_STREAK_BRAKE_AFTER:
-      "HOLD" - the inversion mode of the last resolved trade is kept instead of
-               being re-decided, BUT ONLY while the evidence is ambiguous, i.e.
-               the virtual win rate is within LOSS_STREAK_BRAKE_HOLD_MARGIN
-               points of the active threshold.  A decisive virtual win rate
-               (further away than the margin) always goes through the normal
-               threshold rule, so the brake can never pin the bot to a mode
-               that the virtual win rate clearly says is losing.
-      "SKIP" - the next LOSS_STREAK_BRAKE_SKIP_SIGNALS signals are skipped, then
-               one trade is allowed again (and the skip counter re-arms while
-               the streak continues)
-  A real win ends the brake.  The martingale is NOT affected by the brake.
+The factor schedule is explicit and configurable: 2.0, 2.5, 3.5 percentage
+points for the first three outstanding same-type losses, then +1.0 point per
+additional outstanding loss. These are defaults, not a prediction of market
+behaviour or a guarantee of profitability.
 """
 
 import asyncio
@@ -185,7 +78,7 @@ PRINT_TICKS = True
 
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
-MAX_MARTINGALE_STEPS = 8
+MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 120.0
 TARGET_PL = 10000.0
 
@@ -205,60 +98,28 @@ WIN_LOG_ENABLED = False
 WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
-# [INVERT] adaptive signal inversion: ON when virtual win rate <= threshold
-# (percent).  This is the permanent BASELINE; the threshold actually used is
-# the ACTIVE threshold, adjusted by the [THRESHOLD] detector below.
+# [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
+# resolved virtual outcomes. Hysteresis is measured in percentage points.
 INVERSION_THRESHOLD = 46.0
-INVERSION_HYSTERESIS_GAP = (
-    2.2  # percentage-point gap on either side of the active threshold
-)
-# [WARMUP] inversion can only turn ON once this many virtual outcomes exist.  With
-# 1-9 samples the virtual win rate jumps 10-50 points per trade, so the
-# threshold test degenerates into "did the original signal win last time?" and
-# the bot alternates normal / inverted on every trade (see the 8-loss opening
-# streak).  0 = no warm-up (old behaviour).
-INVERSION_MIN_SAMPLES = 5
+INVERSION_HYSTERESIS_GAP = 2.2
 
-# [THRESHOLD] evidence-weighted, reversible adjustment of the active threshold
-THRESHOLD_ALPHA = (
-    0.05  # 0 < ALPHA < 1; a run less likely than this by chance gets the full push
-)
-THRESHOLD_MARGIN = 1.0  # percentage points, >= 0
-THRESHOLD_MAX_STEP_WEIGHT = (
-    0.5  # 0 < x <= 1; 0.5 means never fully flips in fewer than 2 losses
-)
-THRESHOLD_P_FLOOR = 0.05  # lower clamp of the virtual win rate fraction
-THRESHOLD_P_CEIL = 0.95  # upper clamp of the virtual win rate fraction
-THRESHOLD_MIN = 20.0  # wide safety rail: the active threshold never goes below this
-THRESHOLD_MAX = 90.0  # wide safety rail: the active threshold never goes above this
-THRESHOLD_PRECISION = 6  # decimals kept: prevents float drift from the baseline
-# Stack entries older than this many RESOLVED trades are dropped.  Without it an
-# entry of one type (e.g. inverted losses from an early phase) is only removed by
-# a win of the same type, which may never come, and its weight cancels every
-# later push of the opposite type forever (detector stays pinned at baseline).
-THRESHOLD_ENTRY_TTL = 10
+# [THRESHOLD] Progressive adjustments, in percentage points. The first three
+# same-type outstanding losses use 2.0, 2.5, and 3.5 points; later losses add
+# one point to the last factor. Configure these values to change the schedule.
+THRESHOLD_LOSS_FACTORS = (2.0, 2.5, 3.5)
+THRESHOLD_FACTOR_INCREMENT = 1.0
+THRESHOLD_MIN = 20.0
+THRESHOLD_MAX = 90.0
+THRESHOLD_PRECISION = 6
 
-# [BRAKE] loss-streak brake (stops the normal <-> inverted flip-flop in a streak)
-LOSS_STREAK_BRAKE_ENABLED = False
-LOSS_STREAK_BRAKE_AFTER = 7  # consecutive real losses before the brake engages
-LOSS_STREAK_BRAKE_ACTION = "HOLD"  # "HOLD" = keep last mode, "SKIP" = skip signals
-# HOLD only applies while |virtual win rate - active threshold| <= this many
-# percentage points (ambiguous zone); beyond it the threshold rule decides.
-LOSS_STREAK_BRAKE_HOLD_MARGIN = 3.0
-LOSS_STREAK_BRAKE_SKIP_SIGNALS = 3  # signals skipped per cycle in SKIP mode
-
-# [ROLLING] how the ACTIVE virtual win rate (the one that drives inversion) is
-# calculated:  "WINDOW" = latest N resolved virtual outcomes, "ALL" = all of them
-VIRTUAL_WIN_RATE_MODE = "ALL"  # "WINDOW" or "ALL"
-VIRTUAL_WIN_RATE_WINDOW = 18  # N for WINDOW mode (positive integer)
+# The full-session rate is intentional; no WINDOW mode or sample warm-up.
+VIRTUAL_WIN_RATE_MODE = "ALL"
 
 REQ_TICKS, REQ_BUY, REQ_POC = 1, 5005, 7007
 REQ_POC_QUERY = 7008  # [TIMEOUT] one-shot status query
 REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
 DIRECTIONS = ("UP", "DOWN")
-
-# [INVERT] PUT <-> CALL (SKIP is never inverted)
 INVERSE_SIGNAL = {"PUT": "CALL", "CALL": "PUT"}
 
 
@@ -271,7 +132,6 @@ def new_stats():
     return {d: {"continuation": 0, "reversal": 0, "neutral": 0} for d in DIRECTIONS}
 
 
-# [SEGMENT] helpers
 def new_history():
     """Per-direction ordered outcomes of the current segment."""
     return {d: [] for d in DIRECTIONS}
@@ -282,7 +142,6 @@ def new_segments():
     return {d: 1 for d in DIRECTIONS}
 
 
-# [LOSSLOG] helpers
 def _to_float(value):
     try:
         return float(value)
@@ -298,29 +157,23 @@ def _to_int(value):
 
 
 def _fmt_tick(t):
-    """'07:10:29 | 1170.03 | UP [2]'"""
     if t is None:
         return None
     return f"{timestamp(t['epoch'])} | {t['price']} | {t['dir']} [{t['cnt']}]"
 
 
-# [INVERT] helpers
 def _rate_text(wins, losses):
-    """'55.6% (5W 4L)' or 'n/a (0W 0L)' when nothing has been counted yet."""
     total = wins + losses
     if not total:
         return f"n/a ({wins}W {losses}L)"
     return f"{wins / total * 100:.1f}% ({wins}W {losses}L)"
 
 
-# [THRESHOLD] helpers
 def _round_pct(value):
-    """Round a percentage so repeated add / subtract can never drift."""
     return round(float(value), THRESHOLD_PRECISION)
 
 
 def _pct_text(value):
-    """48.5 -> '48.5%', 44.0 -> '44.0%', 48.25 -> '48.25%'."""
     text = f"{value:.4f}".rstrip("0")
     if text.endswith("."):
         text += "0"
@@ -328,143 +181,45 @@ def _pct_text(value):
 
 
 def _signed_pct_text(value):
-    """+2.5 -> '+2.5%', -3.0 -> '-3.0%', 0 -> '0.0%'."""
     if value == 0:
         return "0.0%"
     return ("+" if value > 0 else "-") + _pct_text(abs(value))
 
 
-# [ROLLING] configuration validation (fails loudly instead of miscalculating)
-def validate_virtual_rate_config():
-    if VIRTUAL_WIN_RATE_MODE not in ("WINDOW", "ALL"):
-        raise ValueError(
-            f"VIRTUAL_WIN_RATE_MODE must be 'WINDOW' or 'ALL', "
-            f"got {VIRTUAL_WIN_RATE_MODE!r}"
-        )
-    if VIRTUAL_WIN_RATE_MODE == "WINDOW" and (
-        isinstance(VIRTUAL_WIN_RATE_WINDOW, bool)
-        or not isinstance(VIRTUAL_WIN_RATE_WINDOW, int)
-        or VIRTUAL_WIN_RATE_WINDOW <= 0
-    ):
-        raise ValueError(
-            f"VIRTUAL_WIN_RATE_WINDOW must be a positive integer in WINDOW mode, "
-            f"got {VIRTUAL_WIN_RATE_WINDOW!r}"
-        )
-
-
-validate_virtual_rate_config()
-
-
-# [THRESHOLD] configuration validation
-def validate_threshold_config():
-    if isinstance(THRESHOLD_ALPHA, bool) or not (0.0 < THRESHOLD_ALPHA < 1.0):
-        raise ValueError(
-            f"THRESHOLD_ALPHA must satisfy 0 < ALPHA < 1, got {THRESHOLD_ALPHA!r}"
-        )
+# Validate the adaptive inversion/threshold configuration at startup.
+def validate_adaptive_config():
+    if not (0.0 <= INVERSION_THRESHOLD <= 100.0):
+        raise ValueError("INVERSION_THRESHOLD must be between 0 and 100")
     if (
-        isinstance(THRESHOLD_MARGIN, bool)
-        or not isinstance(THRESHOLD_MARGIN, (int, float))
-        or THRESHOLD_MARGIN < 0
+        not isinstance(INVERSION_HYSTERESIS_GAP, (int, float))
+        or isinstance(INVERSION_HYSTERESIS_GAP, bool)
+        or INVERSION_HYSTERESIS_GAP < 0
     ):
-        raise ValueError(
-            f"THRESHOLD_MARGIN must be a number >= 0, got {THRESHOLD_MARGIN!r}"
-        )
-    if isinstance(THRESHOLD_MAX_STEP_WEIGHT, bool) or not (
-        0.0 < THRESHOLD_MAX_STEP_WEIGHT <= 1.0
-    ):
-        raise ValueError(
-            f"THRESHOLD_MAX_STEP_WEIGHT must satisfy 0 < x <= 1, "
-            f"got {THRESHOLD_MAX_STEP_WEIGHT!r}"
-        )
-    if not (0.0 < THRESHOLD_P_FLOOR <= THRESHOLD_P_CEIL < 1.0):
-        raise ValueError(
-            f"THRESHOLD_P_FLOOR / THRESHOLD_P_CEIL must satisfy "
-            f"0 < FLOOR <= CEIL < 1, got {THRESHOLD_P_FLOOR!r} / {THRESHOLD_P_CEIL!r}"
-        )
+        raise ValueError("INVERSION_HYSTERESIS_GAP must be a non-negative number")
     if not (0.0 <= THRESHOLD_MIN <= THRESHOLD_MAX <= 100.0):
-        raise ValueError(
-            f"THRESHOLD_MIN / THRESHOLD_MAX must satisfy "
-            f"0 <= MIN <= MAX <= 100, got {THRESHOLD_MIN!r} / {THRESHOLD_MAX!r}"
-        )
+        raise ValueError("THRESHOLD_MIN/MAX must satisfy 0 <= MIN <= MAX <= 100")
     if not (THRESHOLD_MIN <= INVERSION_THRESHOLD <= THRESHOLD_MAX):
-        raise ValueError(
-            f"INVERSION_THRESHOLD ({INVERSION_THRESHOLD!r}) must lie within "
-            f"[THRESHOLD_MIN, THRESHOLD_MAX] = [{THRESHOLD_MIN!r}, {THRESHOLD_MAX!r}]"
-        )
+        raise ValueError("INVERSION_THRESHOLD must lie inside the threshold bounds")
+    if not THRESHOLD_LOSS_FACTORS or any(
+        (not isinstance(x, (int, float)) or isinstance(x, bool) or x <= 0)
+        for x in THRESHOLD_LOSS_FACTORS
+    ):
+        raise ValueError("THRESHOLD_LOSS_FACTORS must contain positive numbers")
+    if (
+        not isinstance(THRESHOLD_FACTOR_INCREMENT, (int, float))
+        or isinstance(THRESHOLD_FACTOR_INCREMENT, bool)
+        or THRESHOLD_FACTOR_INCREMENT < 0
+    ):
+        raise ValueError("THRESHOLD_FACTOR_INCREMENT must be a non-negative number")
     if (
         isinstance(THRESHOLD_PRECISION, bool)
         or not isinstance(THRESHOLD_PRECISION, int)
         or THRESHOLD_PRECISION < 0
     ):
-        raise ValueError(
-            f"THRESHOLD_PRECISION must be a non-negative integer, "
-            f"got {THRESHOLD_PRECISION!r}"
-        )
-    if (
-        isinstance(THRESHOLD_ENTRY_TTL, bool)
-        or not isinstance(THRESHOLD_ENTRY_TTL, int)
-        or THRESHOLD_ENTRY_TTL <= 0
-    ):
-        raise ValueError(
-            f"THRESHOLD_ENTRY_TTL must be a positive integer, "
-            f"got {THRESHOLD_ENTRY_TTL!r}"
-        )
-    if (
-        isinstance(INVERSION_MIN_SAMPLES, bool)
-        or not isinstance(INVERSION_MIN_SAMPLES, int)
-        or INVERSION_MIN_SAMPLES < 0
-    ):
-        raise ValueError(
-            f"INVERSION_MIN_SAMPLES must be a non-negative integer, "
-            f"got {INVERSION_MIN_SAMPLES!r}"
-        )
-    if (
-        isinstance(INVERSION_HYSTERESIS_GAP, bool)
-        or not isinstance(INVERSION_HYSTERESIS_GAP, (int, float))
-        or INVERSION_HYSTERESIS_GAP < 0
-    ):
-        raise ValueError(
-            f"INVERSION_HYSTERESIS_GAP must be a number >= 0, "
-            f"got {INVERSION_HYSTERESIS_GAP!r}"
-        )
-    if (
-        VIRTUAL_WIN_RATE_MODE == "WINDOW"
-        and INVERSION_MIN_SAMPLES > VIRTUAL_WIN_RATE_WINDOW
-    ):
-        raise ValueError(
-            f"INVERSION_MIN_SAMPLES ({INVERSION_MIN_SAMPLES}) cannot exceed "
-            f"VIRTUAL_WIN_RATE_WINDOW ({VIRTUAL_WIN_RATE_WINDOW}) in WINDOW mode"
-        )
+        raise ValueError("THRESHOLD_PRECISION must be a non-negative integer")
 
 
-validate_threshold_config()
-
-
-# [BRAKE] configuration validation
-def validate_brake_config():
-    if LOSS_STREAK_BRAKE_ACTION not in ("HOLD", "SKIP"):
-        raise ValueError(
-            f"LOSS_STREAK_BRAKE_ACTION must be 'HOLD' or 'SKIP', "
-            f"got {LOSS_STREAK_BRAKE_ACTION!r}"
-        )
-    for name, value in (
-        ("LOSS_STREAK_BRAKE_AFTER", LOSS_STREAK_BRAKE_AFTER),
-        ("LOSS_STREAK_BRAKE_SKIP_SIGNALS", LOSS_STREAK_BRAKE_SKIP_SIGNALS),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    if (
-        isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, bool)
-        or not isinstance(LOSS_STREAK_BRAKE_HOLD_MARGIN, (int, float))
-        or LOSS_STREAK_BRAKE_HOLD_MARGIN < 0
-    ):
-        raise ValueError(
-            f"LOSS_STREAK_BRAKE_HOLD_MARGIN must be a number >= 0, "
-            f"got {LOSS_STREAK_BRAKE_HOLD_MARGIN!r}"
-        )
-
-
-validate_brake_config()
+validate_adaptive_config()
 
 
 # --------------------------------------------------------------------------- #
@@ -552,38 +307,25 @@ class Bot:
         self.basket = 0.0
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
 
-        # [INVERT] independent inversion statistics
-        self.trade_meta = {}  # contract_id -> {"original", "executed", "inverted"}
-        self.real_wins = self.real_losses = 0  # actual execution outcomes
-        self.virtual_wins = self.virtual_losses = 0  # LIFETIME original-signal outcomes
-        # [ROLLING] ordered virtual outcomes (True = virtual WIN) and the ACTIVE
-        # counters derived from them; the active counters drive inversion
-        self.virtual_history = deque(
-            maxlen=(
-                VIRTUAL_WIN_RATE_WINDOW if VIRTUAL_WIN_RATE_MODE == "WINDOW" else None
-            )
-        )
-        self.active_virtual_wins = self.active_virtual_losses = 0
-        self.inv_wins = self.inv_losses = 0  # actual outcomes, inverted trades
-        self.noninv_wins = self.noninv_losses = 0  # actual outcomes, non-inverted
+        # [INVERT] independent real and virtual outcome accounting.
+        self.trade_meta = (
+            {}
+        )  # contract_id -> immutable original/executed/inverted metadata
+        self.real_wins = self.real_losses = 0
+        self.virtual_wins = self.virtual_losses = 0
+        self.virtual_history = []  # append-only: True = original signal would win
+        self.inv_wins = self.inv_losses = 0
+        self.noninv_wins = self.noninv_losses = 0
 
-        # [THRESHOLD] baseline (never modified) and dynamically adjusted threshold
+        # [THRESHOLD] Append-only event ledger. A loss event is never removed;
+        # a win marks its matching loss reversed and appends a compensating event.
         self.baseline_threshold = _round_pct(INVERSION_THRESHOLD)
         self.active_threshold = self.baseline_threshold
-        # [INVERT] persistent mode for hysteresis inside the threshold gap
         self.inversion_mode = False
-        # LIFO stack of outstanding loss entries; each entry:
-        #   {"inverted": bool, "weight": float, "position": n, "seq": resolution no.}
-        self.threshold_stack = []
-        self.threshold_loss_streak = 0  # consecutive REAL losses (feeds the brake)
-        self.threshold_resolutions = (
-            0  # resolved trades seen by the detector (entry age)
-        )
-        self.last_threshold_change = None  # description of the latest movement
-
-        # [BRAKE] last resolved trade's inversion mode and SKIP-mode cooldown
-        self.last_trade_inverted = None
-        self.brake_skips_left = 0
+        self.threshold_ledger = []
+        self.threshold_event_id = 0
+        self.threshold_loss_streak = 0
+        self.last_threshold_change = None
 
     # ----------------------------------------------------------------- utils
     def trigger_count(self):
@@ -617,76 +359,20 @@ class Bot:
         return f"SESSION BIAS | {symbol} | " + "  ||  ".join(parts)
 
     # [INVERT] ----------------------------------------------------------
-    def inversion_warming_up(self):
-        """[WARMUP] True while there are too few virtual outcomes to trust the rate."""
-        total = self.active_virtual_wins + self.active_virtual_losses
-        return total < INVERSION_MIN_SAMPLES
+    def virtual_rate_pct(self):
+        """Full-session virtual win rate, or None before the first resolution."""
+        total = self.virtual_wins + self.virtual_losses
+        if total == 0:
+            return None
+        return self.virtual_wins * 100.0 / total
 
     def inversion_active(self):
-        """
-        Inversion decision, based EXCLUSIVELY on the virtual win rate:
-        ON when virtual win rate <= ACTIVE threshold (inclusive), OFF above.
-        With no virtual trades yet there is no rate: inversion stays OFF.
-        Integer-weighted cross-multiplication avoids float rounding at the
-        threshold boundary.
-        """
-        # [ROLLING] uses the ACTIVE counters (window or all), never the lifetime ones
-        total = self.active_virtual_wins + self.active_virtual_losses
-        if not total or self.inversion_warming_up():  # [WARMUP]
-            return False
-        # [THRESHOLD] the dynamically adjusted threshold, not the baseline
-        return self.active_virtual_wins * 100 <= self.active_threshold * total
-
-    # [BRAKE] -----------------------------------------------------------
-    def brake_active(self):
-        return (
-            LOSS_STREAK_BRAKE_ENABLED
-            and self.threshold_loss_streak >= LOSS_STREAK_BRAKE_AFTER
-        )
-
-    def virtual_rate_pct(self):
-        """Active virtual win rate in percent, or None with no samples."""
-        total = self.active_virtual_wins + self.active_virtual_losses
-        if not total:
-            return None
-        return self.active_virtual_wins * 100 / total
-
-    def brake_holds(self):
-        """
-        True when the HOLD brake overrides the threshold rule: brake engaged,
-        HOLD action, a previous mode exists, and the virtual win rate lies
-        inside the ambiguous zone around the active threshold.
-        """
-        if (
-            not self.brake_active()
-            or LOSS_STREAK_BRAKE_ACTION != "HOLD"
-            or self.last_trade_inverted is None
-        ):
-            return False
+        """Raw threshold comparison, provided for reporting only."""
         rate = self.virtual_rate_pct()
-        if rate is None:
-            return False
-        return (
-            round(abs(rate - self.active_threshold), 6) <= LOSS_STREAK_BRAKE_HOLD_MARGIN
-        )
+        return False if rate is None else rate <= self.active_threshold
 
     def decide_inversion(self):
-        """
-        Inversion state for the next order.
-
-        Hysteresis prevents mode changes near the active threshold:
-        - turn ON at or below threshold - INVERSION_HYSTERESIS_GAP;
-        - turn OFF at or above threshold + INVERSION_HYSTERESIS_GAP;
-        - retain the previous mode inside the gap.
-        The existing warm-up and HOLD-brake rules retain precedence.
-        """
-        if self.inversion_warming_up():  # [WARMUP]
-            self.inversion_mode = False
-            return False
-        if self.brake_holds():
-            self.inversion_mode = bool(self.last_trade_inverted)
-            return self.inversion_mode
-
+        """Apply hysteresis to the full-session virtual win rate."""
         rate = self.virtual_rate_pct()
         if rate is None:
             self.inversion_mode = False
@@ -694,238 +380,158 @@ class Bot:
             self.inversion_mode = True
         elif rate >= self.active_threshold + INVERSION_HYSTERESIS_GAP:
             self.inversion_mode = False
-
+        # Inside the band, retain the previous state; no data is discarded.
         return self.inversion_mode
 
-    def brake_should_skip(self):
-        """SKIP mode: True (and counts one skipped signal) while cooling down."""
-        if (
-            self.brake_active()
-            and LOSS_STREAK_BRAKE_ACTION == "SKIP"
-            and self.brake_skips_left > 0
-        ):
-            self.brake_skips_left -= 1
-            return True
-        return False
-
-    def brake_text(self):
-        if not LOSS_STREAK_BRAKE_ENABLED:
-            return "DISABLED"
-        if not self.brake_active():
-            return f"inactive (engages at {LOSS_STREAK_BRAKE_AFTER} consecutive losses)"
-        if LOSS_STREAK_BRAKE_ACTION == "HOLD":
-            rate = self.virtual_rate_pct()
-            if self.brake_holds():
-                mode = "INVERTED" if self.last_trade_inverted else "NORMAL"
-                return (
-                    f"ACTIVE (HOLD: virtual {rate:.1f}% is within "
-                    f"{LOSS_STREAK_BRAKE_HOLD_MARGIN:g} pts of threshold, "
-                    f"next trade keeps {mode} mode)"
-                )
-            if rate is None:
-                return "ACTIVE (HOLD: no virtual samples, threshold rule decides)"
-            return (
-                f"ACTIVE (HOLD standing down: virtual {rate:.1f}% is "
-                f"{abs(rate - self.active_threshold):.1f} pts from threshold, "
-                f"> {LOSS_STREAK_BRAKE_HOLD_MARGIN:g}; threshold rule decides)"
-            )
-        return f"ACTIVE (SKIP: {self.brake_skips_left} signal(s) left to skip)"
-
     def record_virtual_outcome(self, virtual_win):
-        """
-        [ROLLING] Record ONE virtual outcome: lifetime counters always grow; the
-        ordered history / active counters keep only the latest N in WINDOW mode.
-        """
-        if virtual_win:
+        """Append exactly one original-signal outcome; lifetime totals never shrink."""
+        outcome = bool(virtual_win)
+        self.virtual_history.append(outcome)
+        if outcome:
             self.virtual_wins += 1
         else:
             self.virtual_losses += 1
 
-        history = self.virtual_history
-        if history.maxlen is not None and len(history) == history.maxlen:
-            oldest = history.popleft()  # leaves the window immediately
-            if oldest:
-                self.active_virtual_wins -= 1
-            else:
-                self.active_virtual_losses -= 1
-
-        history.append(bool(virtual_win))
-        if virtual_win:
-            self.active_virtual_wins += 1
-        else:
-            self.active_virtual_losses += 1
-
     # [THRESHOLD] -------------------------------------------------------
-    def threshold_vwr_fraction(self):
-        """
-        Active virtual win rate as a fraction clamped to
-        [THRESHOLD_P_FLOOR, THRESHOLD_P_CEIL], or None with no virtual samples.
-        """
-        total = self.active_virtual_wins + self.active_virtual_losses
-        if not total:
-            return None
-        p = self.active_virtual_wins / total
-        return min(THRESHOLD_P_CEIL, max(THRESHOLD_P_FLOOR, p))
+    def reversed_loss_event_ids(self):
+        """IDs of loss events that have a corresponding reversal event."""
+        return {
+            event["reverses_event_id"]
+            for event in self.threshold_ledger
+            if event["kind"] == "reversal"
+        }
 
-    def threshold_loss_weight(self, inverted):
-        """
-        Weight of ONE real loss: how surprising the loss is under the current
-        virtual win rate, scaled so that probability ALPHA gives weight 1 and
-        capped at THRESHOLD_MAX_STEP_WEIGHT.
-        """
-        p = self.threshold_vwr_fraction()
-        if p is None:
-            return 0.0
-        s_trig = math.log(1.0 / THRESHOLD_ALPHA)
-        s = -math.log(p) if inverted else -math.log(1.0 - p)
-        return min(THRESHOLD_MAX_STEP_WEIGHT, s / s_trig)
+    def threshold_unreversed_losses(self, inverted):
+        reversed_ids = self.reversed_loss_event_ids()
+        return sum(
+            1
+            for event in self.threshold_ledger
+            if event["kind"] == "loss"
+            and event["inverted"] is bool(inverted)
+            and event["event_id"] not in reversed_ids
+        )
 
-    def compute_active_threshold(self):
-        """
-        Active threshold from the stack and the current virtual win rate.
-        Empty stack (or no virtual samples) -> exactly the baseline.
-        """
-        if not self.threshold_stack:
-            return self.baseline_threshold
-        p = self.threshold_vwr_fraction()
-        if p is None:
-            return self.baseline_threshold
+    def threshold_factor(self, position):
+        if position <= len(THRESHOLD_LOSS_FACTORS):
+            return float(THRESHOLD_LOSS_FACTORS[position - 1])
+        return float(
+            THRESHOLD_LOSS_FACTORS[-1]
+            + THRESHOLD_FACTOR_INCREMENT * (position - len(THRESHOLD_LOSS_FACTORS))
+        )
 
-        up = sum(e["weight"] for e in self.threshold_stack if not e["inverted"])
-        down = sum(e["weight"] for e in self.threshold_stack if e["inverted"])
-        net = max(-1.0, min(1.0, up - down))
-
-        baseline = self.baseline_threshold
-        vwr_pct = p * 100.0
-        t_up = max(baseline, vwr_pct + THRESHOLD_MARGIN)
-        t_dn = min(baseline, vwr_pct - THRESHOLD_MARGIN)
-        if net >= 0:
-            thr = baseline + (t_up - baseline) * net
-        else:
-            thr = baseline - (baseline - t_dn) * abs(net)
-        return _round_pct(min(THRESHOLD_MAX, max(THRESHOLD_MIN, thr)))
+    def recompute_active_threshold(self):
+        """Sum the complete append-only ledger, then apply display safety bounds."""
+        net = sum(float(event["delta"]) for event in self.threshold_ledger)
+        raw = self.baseline_threshold + net
+        self.active_threshold = _round_pct(min(THRESHOLD_MAX, max(THRESHOLD_MIN, raw)))
+        return self.active_threshold
 
     def update_threshold(self, inverted, won):
-        """
-        Deterioration detector.  Called exactly once per resolved real trade
-        (from record_inversion_result, after record_virtual_outcome has updated
-        the active virtual win rate).  `inverted` is the trade's OWN stored
-        execution flag, never the bot's current inversion state.
-
-        LOSS: streak += 1 (still feeds the brake), push a weighted entry.
-        WIN : streak resets to 0 and the most recent stack entry whose
-              "inverted" flag equals the resolved trade's flag is popped.
-              Without one, nothing is popped.
-        After either, the active threshold is recomputed from the stack and
-        the current virtual win rate.
-        """
+        """Append one real outcome and its exact threshold effect to the ledger."""
         inverted = bool(inverted)
-
-        # drop stale evidence first (entries older than THRESHOLD_ENTRY_TTL trades)
-        self.threshold_resolutions += 1
-        self.threshold_stack = [
-            e
-            for e in self.threshold_stack
-            if self.threshold_resolutions - e["seq"] < THRESHOLD_ENTRY_TTL
-        ]
         before = self.active_threshold
+        self.threshold_event_id += 1
+        reversed_ids = self.reversed_loss_event_ids()
 
         if won:
-            self.threshold_loss_streak = 0  # next loss starts a new streak
-            self.brake_skips_left = 0  # [BRAKE] a real win ends the brake
-
-            # most recent outstanding entry of THIS trade's type
-            index = None
-            for i in range(len(self.threshold_stack) - 1, -1, -1):
-                if self.threshold_stack[i]["inverted"] == inverted:
-                    index = i
+            self.threshold_loss_streak = 0
+            match = None
+            # Search all historical loss events newest-first; no event is removed
+            # or mutated. A reversal event references the original loss by ID.
+            for event in reversed(self.threshold_ledger):
+                if (
+                    event["kind"] == "loss"
+                    and event["inverted"] is inverted
+                    and event["event_id"] not in reversed_ids
+                ):
+                    match = event
                     break
 
-            if index is None:
-                self.active_threshold = self.compute_active_threshold()
+            if match is None:
+                self.threshold_ledger.append(
+                    {
+                        "event_id": self.threshold_event_id,
+                        "kind": "win_no_match",
+                        "inverted": inverted,
+                        "delta": 0.0,
+                        "reverses_event_id": None,
+                    }
+                )
                 self.last_threshold_change = {
-                    "kind": "none",
+                    "kind": "win_no_match",
                     "change": 0.0,
                     "intended": 0.0,
-                    "position": 0,
                     "entry_inverted": inverted,
+                    "position": 0,
                 }
                 return
 
-            entry = self.threshold_stack.pop(index)
-            self.active_threshold = self.compute_active_threshold()
-            change = _round_pct(self.active_threshold - before)
+            delta = -float(match["delta"])
+            self.threshold_ledger.append(
+                {
+                    "event_id": self.threshold_event_id,
+                    "kind": "reversal",
+                    "inverted": inverted,
+                    "delta": delta,
+                    "factor": float(match["factor"]),
+                    "reverses_event_id": match["event_id"],
+                    "position": match["position"],
+                }
+            )
+            self.recompute_active_threshold()
+            actual = _round_pct(self.active_threshold - before)
             self.last_threshold_change = {
                 "kind": "reversal",
-                "change": change,
-                "intended": change,
-                "position": entry["position"],
-                "entry_inverted": entry["inverted"],
+                "change": actual,
+                "intended": delta,
+                "entry_inverted": inverted,
+                "position": match["position"],
+                "factor": float(match["factor"]),
             }
             return
 
-        # real loss
         self.threshold_loss_streak += 1
-        position = self.threshold_loss_streak
-        weight = self.threshold_loss_weight(inverted)
-
-        self.threshold_stack.append(
+        position = self.threshold_unreversed_losses(inverted) + 1
+        factor = self.threshold_factor(position)
+        delta = -factor if inverted else factor
+        self.threshold_ledger.append(
             {
+                "event_id": self.threshold_event_id,
+                "kind": "loss",
                 "inverted": inverted,
-                "weight": weight,
+                "delta": delta,
+                "factor": factor,
                 "position": position,
-                "seq": self.threshold_resolutions,
             }
         )
-        self.active_threshold = self.compute_active_threshold()
-        if self.brake_active():  # [BRAKE] (re)arm the SKIP-mode cooldown
-            self.brake_skips_left = LOSS_STREAK_BRAKE_SKIP_SIGNALS
-        change = _round_pct(self.active_threshold - before)
+        self.recompute_active_threshold()
+        actual = _round_pct(self.active_threshold - before)
         self.last_threshold_change = {
             "kind": "loss",
-            "change": change,
-            "intended": change,
-            "position": position,
+            "change": actual,
+            "intended": delta,
             "entry_inverted": inverted,
+            "position": position,
+            "factor": factor,
         }
 
     def threshold_change_text(self):
-        """One-line description of the latest threshold movement."""
         info = self.last_threshold_change
         if info is None:
             return "none yet"
-        change, intended = info["change"], info["intended"]
+        change = info["change"]
+        intended = info["intended"]
         clamp = (
             ""
             if change == intended
-            else f" (wanted {_signed_pct_text(intended)}, clamped)"
+            else f" (ledger delta {_signed_pct_text(intended)}; active threshold bounded)"
         )
-        if info["kind"] == "loss":
-            side = "inverted" if info["entry_inverted"] else "normal"
-            word = (
-                "increased"
-                if change > 0
-                else "decreased" if change < 0 else "unchanged"
-            )
-            return (
-                f"{_signed_pct_text(change)}{clamp} "
-                f"(loss #{info['position']}, {side} trade: threshold {word})"
-            )
-        if info["kind"] == "reversal":
-            side = "inverted" if info["entry_inverted"] else "normal"
-            article = "an" if info["entry_inverted"] else "a"
-            word = (
-                "increased"
-                if change > 0
-                else "decreased" if change < 0 else "unchanged"
-            )
-            return (
-                f"{_signed_pct_text(change)}{clamp} "
-                f"(win reversed loss #{info['position']} adjustment of {article} "
-                f"{side} trade: threshold {word})"
-            )
         side = "inverted" if info["entry_inverted"] else "normal"
-        return f"0.0% (win: no outstanding {side} adjustment to reverse)"
+        if info["kind"] == "loss":
+            return f"{_signed_pct_text(change)}{clamp} (loss #{info['position']}, {side}: factor {info['factor']:g})"
+        if info["kind"] == "reversal":
+            return f"{_signed_pct_text(change)}{clamp} (win reversed loss #{info['position']} {side} factor {info['factor']:g})"
+        return f"0.0% (win: no unreversed {side} loss adjustment exists)"
 
     def record_inversion_result(self, meta, status):
         """
@@ -938,7 +544,6 @@ class Bot:
             return
         won = status == "won"
         inverted = meta["inverted"]
-        self.last_trade_inverted = bool(inverted)  # [BRAKE]
 
         # real: what actually happened
         if won:
@@ -950,7 +555,7 @@ class Bot:
         # trade is the original signal; an inverted trade is its opposite, so
         # the outcome is reversed.
         virtual_win = won != inverted
-        self.record_virtual_outcome(virtual_win)  # [ROLLING]
+        self.record_virtual_outcome(virtual_win)  # all session outcomes
 
         # inverted / non-inverted: actual outcomes
         if inverted:
@@ -964,65 +569,50 @@ class Bot:
             else:
                 self.noninv_losses += 1
 
-        # [THRESHOLD] real outcome + the trade's own execution flag
+        # [THRESHOLD] real outcome + the trade's own stored execution flag
         self.update_threshold(inverted, won)
 
     def inversion_report(self, meta, status, contract_id):
-        """Report lines, built AFTER the counters include the current trade."""
-        if status not in ("won", "lost"):
+        """Report adaptive state after counters include the current trade."""
+        if status not in ("lost", "won"):
             return
         if meta is None:
             print(
-                f"[INVERT] no inversion metadata for contract {contract_id}: "
-                f"not counted in inversion statistics"
+                f"[INVERT] no inversion metadata for contract {contract_id}: not counted"
             )
             return
         outcome = "WIN" if status == "won" else "LOSS"
-        inv_state = "ON" if self.decide_inversion() else "OFF"  # [BRAKE]
-        rule_state = "ON" if self.inversion_active() else "OFF"
-        if self.brake_holds():
-            inv_reason = (
-                f"held by brake; threshold rule says {rule_state} "
-                f"at <= {_pct_text(self.active_threshold)}"
-            )
-        elif self.inversion_warming_up():  # [WARMUP]
-            inv_reason = (
-                f"warm-up: {len(self.virtual_history)}/{INVERSION_MIN_SAMPLES} "
-                f"virtual samples needed"
-            )
-        else:
-            inv_reason = f"threshold <= {_pct_text(self.active_threshold)}"
+        inv_state = "ON" if self.decide_inversion() else "OFF"
+        rate = self.virtual_rate_pct()
         print("   ---------------- ADAPTIVE INVERSION ----------------")
         print(f"   Original signal: {meta['original']}")
         print(f"   Executed signal: {meta['executed']}")
         print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
         print(f"   Actual outcome: {outcome}")
         print(f"   Real Win Rate: {_rate_text(self.real_wins, self.real_losses)}")
-        samples = len(self.virtual_history)
-        if VIRTUAL_WIN_RATE_MODE == "WINDOW":
-            mode_text = f"Mode: WINDOW | Samples: {samples}/{VIRTUAL_WIN_RATE_WINDOW}"
-        else:
-            mode_text = f"Mode: ALL | Samples: {samples}"
         print(
-            f"   Virtual Win Rate: "
-            f"{_rate_text(self.active_virtual_wins, self.active_virtual_losses)}"
-            f" | {mode_text}"
-        )
-        print(
-            f"   Lifetime Virtual Win Rate: "
-            f"{_rate_text(self.virtual_wins, self.virtual_losses)}"
+            f"   Virtual Win Rate (ALL): {_rate_text(self.virtual_wins, self.virtual_losses)}"
         )
         print(f"   Inverted Trades: {self.inv_wins}W {self.inv_losses}L")
         print(f"   Non-Inverted Trades: {self.noninv_wins}W {self.noninv_losses}L")
         print(f"   Cumulative: {self.wins}W {self.losses}L")
-        # [THRESHOLD] detector state, immediately after this resolution
         print(f"   Baseline Threshold: {_pct_text(self.baseline_threshold)}")
         print(f"   Active Threshold: {_pct_text(self.active_threshold)}")
-        print(f"   Current Loss Streak: {self.threshold_loss_streak}")
-        print(f"   Outstanding Adjustments: {len(self.threshold_stack)}")
+        print(f"   Threshold Ledger Events: {len(self.threshold_ledger)} (append-only)")
+        print(f"   Unreversed Normal Losses: {self.threshold_unreversed_losses(False)}")
+        print(
+            f"   Unreversed Inverted Losses: {self.threshold_unreversed_losses(True)}"
+        )
         print(f"   Last Adjustment: {self.threshold_change_text()}")
-        print(f"   Loss-Streak Brake: {self.brake_text()}")  # [BRAKE]
-        print(f"   Inversion for next signal: {inv_state} " f"({inv_reason})")
+        if rate is None:
+            reason = "no resolved virtual outcomes"
+        elif rate <= self.active_threshold - INVERSION_HYSTERESIS_GAP:
+            reason = f"virtual {rate:.1f}% <= ON boundary {self.active_threshold - INVERSION_HYSTERESIS_GAP:.1f}%"
+        elif rate >= self.active_threshold + INVERSION_HYSTERESIS_GAP:
+            reason = f"virtual {rate:.1f}% >= OFF boundary {self.active_threshold + INVERSION_HYSTERESIS_GAP:.1f}%"
+        else:
+            reason = f"hysteresis band; retaining previous mode ({inv_state})"
+        print(f"   Inversion for next signal: {inv_state} ({reason})")
         print("   ----------------------------------------------------")
 
     # [SEGMENT] ---------------------------------------------------------
@@ -1445,11 +1035,6 @@ class Bot:
                 note = f" | [SKIP] {direction} bias not decisive (N={decided})"
             elif self.busy:
                 note = " | [SKIP] contract still open"
-            elif self.brake_should_skip():  # [BRAKE] SKIP-mode cooldown
-                note = (
-                    f" | [SKIP] loss-streak brake (streak "
-                    f"{self.threshold_loss_streak}, {self.brake_skips_left} more to skip)"
-                )
             else:
                 # [INVERT] decide with the virtual win rate available right now;
                 # SKIP never reaches this branch, so it can never be inverted.
@@ -2064,32 +1649,16 @@ class Bot:
                         f"INVERSION_THRESHOLD={INVERSION_THRESHOLD:.0f}% (baseline) "
                         f"(invert PUT/CALL when virtual win rate <= active threshold)"
                     )
-                    print(  # [THRESHOLD]
-                        f"THRESHOLD_ALPHA={THRESHOLD_ALPHA} | "
-                        f"THRESHOLD_MARGIN={THRESHOLD_MARGIN} | "
-                        f"THRESHOLD_MAX_STEP_WEIGHT={THRESHOLD_MAX_STEP_WEIGHT} | "
-                        f"THRESHOLD_P_FLOOR={THRESHOLD_P_FLOOR} | "
-                        f"THRESHOLD_P_CEIL={THRESHOLD_P_CEIL} | "
-                        f"THRESHOLD_ENTRY_TTL={THRESHOLD_ENTRY_TTL} | "
-                        f"INVERSION_MIN_SAMPLES={INVERSION_MIN_SAMPLES} | "
-                        f"THRESHOLD_MIN={THRESHOLD_MIN} | THRESHOLD_MAX={THRESHOLD_MAX} | "
-                        f"ACTIVE_THRESHOLD={_pct_text(self.active_threshold)} "
-                        f"(outstanding adjustments: {len(self.threshold_stack)})"
+                    print(
+                        f"THRESHOLD_FACTORS={THRESHOLD_LOSS_FACTORS} | "
+                        f"FACTOR_INCREMENT={THRESHOLD_FACTOR_INCREMENT} | "
+                        f"BOUNDS=[{THRESHOLD_MIN}, {THRESHOLD_MAX}] | "
+                        f"ACTIVE_THRESHOLD={_pct_text(self.active_threshold)} | "
+                        f"LEDGER_EVENTS={len(self.threshold_ledger)}"
                     )
-                    print(  # [BRAKE]
-                        f"LOSS_STREAK_BRAKE={LOSS_STREAK_BRAKE_ENABLED} | "
-                        f"AFTER={LOSS_STREAK_BRAKE_AFTER} | "
-                        f"ACTION={LOSS_STREAK_BRAKE_ACTION} | "
-                        f"HOLD_MARGIN={LOSS_STREAK_BRAKE_HOLD_MARGIN:g} | "
-                        f"SKIP_SIGNALS={LOSS_STREAK_BRAKE_SKIP_SIGNALS}"
-                    )
-                    print(  # [ROLLING]
-                        f"VIRTUAL_WIN_RATE_MODE={VIRTUAL_WIN_RATE_MODE}"
-                        + (
-                            f" | VIRTUAL_WIN_RATE_WINDOW={VIRTUAL_WIN_RATE_WINDOW}"
-                            if VIRTUAL_WIN_RATE_MODE == "WINDOW"
-                            else ""
-                        )
+                    print(
+                        f"VIRTUAL_WIN_RATE_MODE=ALL | "
+                        f"HYSTERESIS_GAP={INVERSION_HYSTERESIS_GAP}pp"
                     )
                     await self.on_connect()
                     delay = 2
