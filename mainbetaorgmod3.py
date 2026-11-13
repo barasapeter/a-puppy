@@ -82,7 +82,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 120.0
-TARGET_PL = 10000.0
+TARGET_PL = 30.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
@@ -109,10 +109,10 @@ INVERSION_HYSTERESIS_GAP = 2.2
 # execution direction with evidence in the current streak-direction bucket.
 # Symmetric: it can correct either an inversion or a normal signal.
 LONG_LOSS_GUARD_ENABLED = True
-LONG_LOSS_GUARD_START = 4           # consecutive settled losses before guard applies
-LONG_LOSS_GUARD_MIN_SAMPLES = 25    # decided outcomes; neutral samples excluded
-LONG_LOSS_GUARD_SUPPORT_RATE = 0.58 # minimum share for the supported direction
-LONG_LOSS_GUARD_MIN_EDGE = 0.10     # supported direction must lead by 10 percentage points
+LONG_LOSS_GUARD_START = 4  # consecutive settled losses before guard applies
+LONG_LOSS_GUARD_MIN_SAMPLES = 25  # decided outcomes; neutral samples excluded
+LONG_LOSS_GUARD_SUPPORT_RATE = 0.58  # minimum share for the supported direction
+LONG_LOSS_GUARD_MIN_EDGE = 0.10  # supported direction must lead by 10 percentage points
 
 # [THRESHOLD] Progressive adjustments, in percentage points. The first three
 # same-type outstanding losses use 2.0, 2.5, and 3.5 points; later losses add
@@ -132,6 +132,7 @@ REQ_PROPOSAL = {"CALL": 8001, "PUT": 8002}
 
 DIRECTIONS = ("UP", "DOWN")
 INVERSE_SIGNAL = {"PUT": "CALL", "CALL": "PUT"}
+
 
 def timestamp(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%H:%M:%S")
@@ -200,21 +201,44 @@ def _signed_pct_text(value):
 def validate_adaptive_config():
     if not (0.0 <= INVERSION_THRESHOLD <= 100.0):
         raise ValueError("INVERSION_THRESHOLD must be between 0 and 100")
-    if not isinstance(INVERSION_HYSTERESIS_GAP, (int, float)) or isinstance(INVERSION_HYSTERESIS_GAP, bool) or INVERSION_HYSTERESIS_GAP < 0:
+    if (
+        not isinstance(INVERSION_HYSTERESIS_GAP, (int, float))
+        or isinstance(INVERSION_HYSTERESIS_GAP, bool)
+        or INVERSION_HYSTERESIS_GAP < 0
+    ):
         raise ValueError("INVERSION_HYSTERESIS_GAP must be a non-negative number")
     if not (0.0 <= THRESHOLD_MIN <= THRESHOLD_MAX <= 100.0):
         raise ValueError("THRESHOLD_MIN/MAX must satisfy 0 <= MIN <= MAX <= 100")
     if not (THRESHOLD_MIN <= INVERSION_THRESHOLD <= THRESHOLD_MAX):
         raise ValueError("INVERSION_THRESHOLD must lie inside the threshold bounds")
-    if not THRESHOLD_LOSS_FACTORS or any((not isinstance(x, (int, float)) or isinstance(x, bool) or x <= 0) for x in THRESHOLD_LOSS_FACTORS):
+    if not THRESHOLD_LOSS_FACTORS or any(
+        (not isinstance(x, (int, float)) or isinstance(x, bool) or x <= 0)
+        for x in THRESHOLD_LOSS_FACTORS
+    ):
         raise ValueError("THRESHOLD_LOSS_FACTORS must contain positive numbers")
-    if not isinstance(THRESHOLD_FACTOR_INCREMENT, (int, float)) or isinstance(THRESHOLD_FACTOR_INCREMENT, bool) or THRESHOLD_FACTOR_INCREMENT < 0:
+    if (
+        not isinstance(THRESHOLD_FACTOR_INCREMENT, (int, float))
+        or isinstance(THRESHOLD_FACTOR_INCREMENT, bool)
+        or THRESHOLD_FACTOR_INCREMENT < 0
+    ):
         raise ValueError("THRESHOLD_FACTOR_INCREMENT must be a non-negative number")
-    if isinstance(THRESHOLD_PRECISION, bool) or not isinstance(THRESHOLD_PRECISION, int) or THRESHOLD_PRECISION < 0:
+    if (
+        isinstance(THRESHOLD_PRECISION, bool)
+        or not isinstance(THRESHOLD_PRECISION, int)
+        or THRESHOLD_PRECISION < 0
+    ):
         raise ValueError("THRESHOLD_PRECISION must be a non-negative integer")
-    if isinstance(LONG_LOSS_GUARD_START, bool) or not isinstance(LONG_LOSS_GUARD_START, int) or LONG_LOSS_GUARD_START < 1:
+    if (
+        isinstance(LONG_LOSS_GUARD_START, bool)
+        or not isinstance(LONG_LOSS_GUARD_START, int)
+        or LONG_LOSS_GUARD_START < 1
+    ):
         raise ValueError("LONG_LOSS_GUARD_START must be a positive integer")
-    if isinstance(LONG_LOSS_GUARD_MIN_SAMPLES, bool) or not isinstance(LONG_LOSS_GUARD_MIN_SAMPLES, int) or LONG_LOSS_GUARD_MIN_SAMPLES < 1:
+    if (
+        isinstance(LONG_LOSS_GUARD_MIN_SAMPLES, bool)
+        or not isinstance(LONG_LOSS_GUARD_MIN_SAMPLES, int)
+        or LONG_LOSS_GUARD_MIN_SAMPLES < 1
+    ):
         raise ValueError("LONG_LOSS_GUARD_MIN_SAMPLES must be a positive integer")
     if not (0.0 <= LONG_LOSS_GUARD_SUPPORT_RATE <= 1.0):
         raise ValueError("LONG_LOSS_GUARD_SUPPORT_RATE must be between 0 and 1")
@@ -312,7 +336,9 @@ class Bot:
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
 
         # [INVERT] independent real and virtual outcome accounting.
-        self.trade_meta = {}  # contract_id -> immutable original/executed/inverted metadata
+        self.trade_meta = (
+            {}
+        )  # contract_id -> immutable original/executed/inverted metadata
         self.real_wins = self.real_losses = 0
         self.virtual_wins = self.virtual_losses = 0
         self.virtual_history = []  # append-only: True = original signal would win
@@ -444,7 +470,9 @@ class Bot:
                 evidence["reason"] = "intended direction already matches evidence"
             else:
                 evidence["triggered"] = True
-                evidence["reason"] = "intended direction conflicts with directional evidence"
+                evidence["reason"] = (
+                    "intended direction conflicts with directional evidence"
+                )
         return evidence
 
     def record_virtual_outcome(self, virtual_win):
@@ -468,7 +496,8 @@ class Bot:
     def threshold_unreversed_losses(self, inverted):
         reversed_ids = self.reversed_loss_event_ids()
         return sum(
-            1 for event in self.threshold_ledger
+            1
+            for event in self.threshold_ledger
             if event["kind"] == "loss"
             and event["inverted"] is bool(inverted)
             and event["event_id"] not in reversed_ids
@@ -477,7 +506,10 @@ class Bot:
     def threshold_factor(self, position):
         if position <= len(THRESHOLD_LOSS_FACTORS):
             return float(THRESHOLD_LOSS_FACTORS[position - 1])
-        return float(THRESHOLD_LOSS_FACTORS[-1] + THRESHOLD_FACTOR_INCREMENT * (position - len(THRESHOLD_LOSS_FACTORS)))
+        return float(
+            THRESHOLD_LOSS_FACTORS[-1]
+            + THRESHOLD_FACTOR_INCREMENT * (position - len(THRESHOLD_LOSS_FACTORS))
+        )
 
     def recompute_active_threshold(self):
         """Sum the complete append-only ledger, then apply display safety bounds."""
@@ -508,34 +540,44 @@ class Bot:
                     break
 
             if match is None:
-                self.threshold_ledger.append({
-                    "event_id": self.threshold_event_id,
-                    "kind": "win_no_match",
-                    "inverted": inverted,
-                    "delta": 0.0,
-                    "reverses_event_id": None,
-                })
+                self.threshold_ledger.append(
+                    {
+                        "event_id": self.threshold_event_id,
+                        "kind": "win_no_match",
+                        "inverted": inverted,
+                        "delta": 0.0,
+                        "reverses_event_id": None,
+                    }
+                )
                 self.last_threshold_change = {
-                    "kind": "win_no_match", "change": 0.0, "intended": 0.0,
-                    "entry_inverted": inverted, "position": 0,
+                    "kind": "win_no_match",
+                    "change": 0.0,
+                    "intended": 0.0,
+                    "entry_inverted": inverted,
+                    "position": 0,
                 }
                 return
 
             delta = -float(match["delta"])
-            self.threshold_ledger.append({
-                "event_id": self.threshold_event_id,
-                "kind": "reversal",
-                "inverted": inverted,
-                "delta": delta,
-                "factor": float(match["factor"]),
-                "reverses_event_id": match["event_id"],
-                "position": match["position"],
-            })
+            self.threshold_ledger.append(
+                {
+                    "event_id": self.threshold_event_id,
+                    "kind": "reversal",
+                    "inverted": inverted,
+                    "delta": delta,
+                    "factor": float(match["factor"]),
+                    "reverses_event_id": match["event_id"],
+                    "position": match["position"],
+                }
+            )
             self.recompute_active_threshold()
             actual = _round_pct(self.active_threshold - before)
             self.last_threshold_change = {
-                "kind": "reversal", "change": actual, "intended": delta,
-                "entry_inverted": inverted, "position": match["position"],
+                "kind": "reversal",
+                "change": actual,
+                "intended": delta,
+                "entry_inverted": inverted,
+                "position": match["position"],
                 "factor": float(match["factor"]),
             }
             return
@@ -544,19 +586,25 @@ class Bot:
         position = self.threshold_unreversed_losses(inverted) + 1
         factor = self.threshold_factor(position)
         delta = -factor if inverted else factor
-        self.threshold_ledger.append({
-            "event_id": self.threshold_event_id,
-            "kind": "loss",
-            "inverted": inverted,
-            "delta": delta,
-            "factor": factor,
-            "position": position,
-        })
+        self.threshold_ledger.append(
+            {
+                "event_id": self.threshold_event_id,
+                "kind": "loss",
+                "inverted": inverted,
+                "delta": delta,
+                "factor": factor,
+                "position": position,
+            }
+        )
         self.recompute_active_threshold()
         actual = _round_pct(self.active_threshold - before)
         self.last_threshold_change = {
-            "kind": "loss", "change": actual, "intended": delta,
-            "entry_inverted": inverted, "position": position, "factor": factor,
+            "kind": "loss",
+            "change": actual,
+            "intended": delta,
+            "entry_inverted": inverted,
+            "position": position,
+            "factor": factor,
         }
 
     def threshold_change_text(self):
@@ -565,7 +613,11 @@ class Bot:
             return "none yet"
         change = info["change"]
         intended = info["intended"]
-        clamp = "" if change == intended else f" (ledger delta {_signed_pct_text(intended)}; active threshold bounded)"
+        clamp = (
+            ""
+            if change == intended
+            else f" (ledger delta {_signed_pct_text(intended)}; active threshold bounded)"
+        )
         side = "inverted" if info["entry_inverted"] else "normal"
         if info["kind"] == "loss":
             return f"{_signed_pct_text(change)}{clamp} (loss #{info['position']}, {side}: factor {info['factor']:g})"
@@ -617,7 +669,9 @@ class Bot:
         if status not in ("lost", "won"):
             return
         if meta is None:
-            print(f"[INVERT] no inversion metadata for contract {contract_id}: not counted")
+            print(
+                f"[INVERT] no inversion metadata for contract {contract_id}: not counted"
+            )
             return
         outcome = "WIN" if status == "won" else "LOSS"
         inv_state = "ON" if self.decide_inversion() else "OFF"
@@ -628,7 +682,9 @@ class Bot:
         print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
         print(f"   Actual outcome: {outcome}")
         print(f"   Real Win Rate: {_rate_text(self.real_wins, self.real_losses)}")
-        print(f"   Virtual Win Rate (ALL): {_rate_text(self.virtual_wins, self.virtual_losses)}")
+        print(
+            f"   Virtual Win Rate (ALL): {_rate_text(self.virtual_wins, self.virtual_losses)}"
+        )
         print(f"   Inverted Trades: {self.inv_wins}W {self.inv_losses}L")
         print(f"   Non-Inverted Trades: {self.noninv_wins}W {self.noninv_losses}L")
         print(f"   Cumulative: {self.wins}W {self.losses}L")
@@ -636,7 +692,9 @@ class Bot:
         print(f"   Active Threshold: {_pct_text(self.active_threshold)}")
         print(f"   Threshold Ledger Events: {len(self.threshold_ledger)} (append-only)")
         print(f"   Unreversed Normal Losses: {self.threshold_unreversed_losses(False)}")
-        print(f"   Unreversed Inverted Losses: {self.threshold_unreversed_losses(True)}")
+        print(
+            f"   Unreversed Inverted Losses: {self.threshold_unreversed_losses(True)}"
+        )
         print(f"   Last Adjustment: {self.threshold_change_text()}")
         if rate is None:
             reason = "no resolved virtual outcomes"
@@ -1124,18 +1182,25 @@ class Bot:
                 )
                 if guard is not None:
                     support_text = (
-                        "n/a" if guard["supported_signal"] is None
+                        "n/a"
+                        if guard["supported_signal"] is None
                         else guard["supported_signal"]
                     )
                     call_text = (
-                        "n/a" if guard["call_support_rate"] is None
+                        "n/a"
+                        if guard["call_support_rate"] is None
                         else f"{guard['call_support_rate'] * 100:.1f}%"
                     )
                     put_text = (
-                        "n/a" if guard["put_support_rate"] is None
+                        "n/a"
+                        if guard["put_support_rate"] is None
                         else f"{guard['put_support_rate'] * 100:.1f}%"
                     )
-                    tag = "[LONG-LOSS GUARD]" if guard["triggered"] else "[LONG-LOSS CHECK]"
+                    tag = (
+                        "[LONG-LOSS GUARD]"
+                        if guard["triggered"]
+                        else "[LONG-LOSS CHECK]"
+                    )
                     note += (
                         f" | {tag} CLS={guard['loss_streak']} "
                         f"CALL-support={call_text} PUT-support={put_text} "
