@@ -67,7 +67,7 @@ MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
 MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
-MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+MIN_EDGE = 0.0005  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
