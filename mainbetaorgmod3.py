@@ -67,7 +67,9 @@ MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
 MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
-MIN_EDGE = 0.0005  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+MIN_EDGE = (
+    0.0005  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
@@ -102,14 +104,14 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
 # resolved virtual outcomes. Hysteresis is measured in percentage points.
-INVERSION_THRESHOLD = 46.0
-INVERSION_HYSTERESIS_GAP = 2.2
+INVERSION_THRESHOLD = 50.0
+INVERSION_HYSTERESIS_GAP = 2.5
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
 # Symmetric: it can correct either an inversion or a normal signal.
-LONG_LOSS_GUARD_ENABLED = True
-LONG_LOSS_GUARD_START = 4  # consecutive settled losses before guard applies
+LONG_LOSS_GUARD_ENABLED = False
+LONG_LOSS_GUARD_START = 10  # consecutive settled losses before guard applies
 LONG_LOSS_GUARD_MIN_SAMPLES = 25  # decided outcomes; neutral samples excluded
 LONG_LOSS_GUARD_SUPPORT_RATE = 0.58  # minimum share for the supported direction
 LONG_LOSS_GUARD_MIN_EDGE = 0.10  # supported direction must lead by 10 percentage points
