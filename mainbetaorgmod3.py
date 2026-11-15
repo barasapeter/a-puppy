@@ -58,7 +58,7 @@ ACCOUNT_TYPE = "demo"
 SYMBOLS = ["1HZ100V"]
 CURRENCY = "USD"
 
-STREAK = 4  # target streak length (virtual, includes look-ahead ticks)
+STREAK = 3  # target streak length (virtual, includes look-ahead ticks)
 BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
 LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
@@ -81,8 +81,8 @@ PRINT_TICKS = True
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
-MAX_STAKE = 80.0
-TARGET_PL = 15000.0
+MAX_STAKE = 500.0
+TARGET_PL = 60.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
