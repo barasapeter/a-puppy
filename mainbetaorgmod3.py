@@ -58,7 +58,7 @@ ACCOUNT_TYPE = "demo"
 SYMBOLS = ["1HZ100V"]
 CURRENCY = "USD"
 
-STREAK = 2  # target streak length (virtual, includes look-ahead ticks)
+STREAK = 4  # target streak length (virtual, includes look-ahead ticks)
 BIAS_WINDOW = 1  # ticks measured after the (virtual) streak completes
 
 LOOKAHEAD = 1  # ticks assumed to continue the streak (0 = legacy behaviour)
@@ -103,7 +103,7 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
 # resolved virtual outcomes. Hysteresis is measured in percentage points.
 INVERSION_THRESHOLD = 47.0
-INVERSION_HYSTERESIS_GAP = 2.5
+INVERSION_HYSTERESIS_GAP = 2
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
