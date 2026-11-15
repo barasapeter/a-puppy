@@ -78,11 +78,11 @@ SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
-BASE_STAKE = 0.35
+BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 120.0
-TARGET_PL = 1.0
+TARGET_PL = 15.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
