@@ -78,7 +78,7 @@ SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
-BASE_STAKE = 1
+BASE_STAKE = 0.35
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 120.0
@@ -391,6 +391,7 @@ class Bot:
         """Full-session virtual win rate, or None before the first resolution."""
         total = self.virtual_wins + self.virtual_losses
         if total == 0:
+
             return None
         return self.virtual_wins * 100.0 / total
 
