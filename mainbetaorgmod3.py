@@ -67,12 +67,12 @@ MAX_LOOKAHEAD = 3
 
 # Per-direction decision guards (0 / 0.0 = same behaviour as before)
 MIN_SAMPLES = 10  # min decided samples in the current direction's bucket
-MIN_EDGE = 0  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
+MIN_EDGE = 0.05  # 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
-SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 50  # when decided samples in a direction reach this -> new segment
-SEGMENT_KEEP = 20  # latest decided samples carried over into the new segment
+SEGMENT_ENABLED = False
+SEGMENT_LIMIT = 5000 # when decided samples in a direction reach this -> new segment
+SEGMENT_KEEP = 2000  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
 USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
