@@ -81,8 +81,8 @@ PRINT_TICKS = True
 BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
-MAX_STAKE = 500.0
-TARGET_PL = 60.0
+MAX_STAKE = 1500.0
+TARGET_PL = 1000.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
