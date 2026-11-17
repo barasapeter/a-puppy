@@ -82,7 +82,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
-TARGET_PL = 1000.0
+TARGET_PL = 60.0
 
 # [TIMEOUT] unresolved-contract watchdog
 UNRESOLVED_TIMEOUT_TICKS = 10  # ticks after buy confirmation before querying
@@ -102,8 +102,8 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
 # resolved virtual outcomes. Hysteresis is measured in percentage points.
-INVERSION_THRESHOLD = 45.0
-INVERSION_HYSTERESIS_GAP = 3
+INVERSION_THRESHOLD = 46.0
+INVERSION_HYSTERESIS_GAP = 2.2
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
