@@ -102,8 +102,8 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
 # resolved virtual outcomes. Hysteresis is measured in percentage points.
-INVERSION_THRESHOLD = 47.0
-INVERSION_HYSTERESIS_GAP = 2
+INVERSION_THRESHOLD = 45.0
+INVERSION_HYSTERESIS_GAP = 3
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
