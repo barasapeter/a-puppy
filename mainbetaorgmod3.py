@@ -79,7 +79,7 @@ USE_PROPOSALS = False  # pre-priced proposals: skips server-side pricing on buy
 PRINT_TICKS = True
 
 BASE_STAKE = 1
-MARTINGALE_MULTIPLIER = 2
+MARTINGALE_MULTIPLIER = 2.11
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
 TARGET_PL = 60.0
@@ -1235,7 +1235,7 @@ class Bot:
         else:
             payload = {
                 "buy": "1",
-                "price": stake,
+                "price": round(stake, 2),
                 "parameters": {
                     "amount": round(stake, 2),
                     "basis": "stake",
