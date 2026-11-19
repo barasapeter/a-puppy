@@ -81,7 +81,7 @@ MIN_EDGE = 0.05  # min gap between reversal and continuation rate (0.05 = 5 pts)
 
 # [SEGMENT] Sliding stats segments (per direction)
 SEGMENT_ENABLED = True
-SEGMENT_LIMIT = 180  # when decided samples in a direction reach this -> new segment
+SEGMENT_LIMIT = 100  # when decided samples in a direction reach this -> new segment
 SEGMENT_KEEP = 80  # latest decided samples carried over into the new segment
 # Growth per segment = SEGMENT_LIMIT - SEGMENT_KEEP
 
