@@ -92,7 +92,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
-TARGET_PL = 60.0
+TARGET_PL = 30.0
 
 # [STAKE] "martingale" = original behaviour (x multiplier + RECOVERY sizing).
 #         "bold"       = size every stake so a single win reaches TARGET_PL.
@@ -122,7 +122,7 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # [INVERT] Adaptive inversion. The session-wide virtual win rate uses ALL
 # resolved virtual outcomes. Hysteresis is measured in percentage points.
 INVERSION_THRESHOLD = 46.0
-INVERSION_HYSTERESIS_GAP = 2.2
+INVERSION_HYSTERESIS_GAP = 3
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
