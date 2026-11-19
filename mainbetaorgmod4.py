@@ -1266,7 +1266,7 @@ class Bot:
                     "basis": "stake",
                     "contract_type": contract_type,
                     "currency": CURRENCY,
-                    "duration": 1,
+                    "duration": 2,
                     "duration_unit": "t",
                     "underlying_symbol": symbol,
                 },
