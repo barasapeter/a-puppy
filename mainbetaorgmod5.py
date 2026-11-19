@@ -102,7 +102,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
-TARGET_PL = 30.0
+TARGET_PL = 3000.0
 
 # [STAKE] "martingale" = original behaviour (x multiplier + RECOVERY sizing).
 #         "bold"       = size every stake so a single win reaches TARGET_PL.
