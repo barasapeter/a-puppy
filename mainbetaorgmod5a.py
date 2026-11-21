@@ -138,7 +138,7 @@ TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 # a direction uses ALL resolved virtual outcomes of that direction.
 # Hysteresis is measured in percentage points.
 INVERSION_THRESHOLD = 46.0
-INVERSION_HYSTERESIS_GAP = 3
+INVERSION_HYSTERESIS_GAP = 10
 
 # [LONG-LOSS GUARD] After a prolonged losing run, compare the intended
 # execution direction with evidence in the current streak-direction bucket.
@@ -834,13 +834,17 @@ class Bot:
         print(f"   Executed signal: {meta['executed']}")
         print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
         print(f"   Actual outcome: {outcome}")
-        print(f"   [{direction}] Real Win Rate: {_rate_text(b.real_wins, b.real_losses)}")
+        print(
+            f"   [{direction}] Real Win Rate: {_rate_text(b.real_wins, b.real_losses)}"
+        )
         print(
             f"   [{direction}] Virtual Win Rate (ALL): "
             f"{_rate_text(b.virtual_wins, b.virtual_losses)}"
         )
         print(f"   [{direction}] Inverted Trades: {b.inv_wins}W {b.inv_losses}L")
-        print(f"   [{direction}] Non-Inverted Trades: {b.noninv_wins}W {b.noninv_losses}L")
+        print(
+            f"   [{direction}] Non-Inverted Trades: {b.noninv_wins}W {b.noninv_losses}L"
+        )
         print(f"   Cumulative (all directions): {self.wins}W {self.losses}L")
         print(f"   [{direction}] Baseline Threshold: {_pct_text(b.baseline_threshold)}")
         print(f"   [{direction}] Active Threshold: {_pct_text(b.active_threshold)}")
@@ -856,7 +860,9 @@ class Bot:
             f"   [{direction}] Unreversed Inverted Losses: "
             f"{self.threshold_unreversed_losses(direction, True)}"
         )
-        print(f"   [{direction}] Last Adjustment: {self.threshold_change_text(direction)}")
+        print(
+            f"   [{direction}] Last Adjustment: {self.threshold_change_text(direction)}"
+        )
         if rate is None:
             reason = "no resolved virtual outcomes"
         elif rate <= b.active_threshold - INVERSION_HYSTERESIS_GAP:
@@ -1368,7 +1374,9 @@ class Bot:
                 if inverted and not inversion_requested:
                     note += " | (executed opposite of original via LONG-LOSS GUARD)"
                 elif inversion_requested and not inverted:
-                    note += " | (inversion overridden back to original by LONG-LOSS GUARD)"
+                    note += (
+                        " | (inversion overridden back to original by LONG-LOSS GUARD)"
+                    )
                 if guard is not None:
                     support_text = (
                         "n/a"
