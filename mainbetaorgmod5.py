@@ -18,7 +18,7 @@ reporting and logging are unchanged. Changes (search "[FIX]", "[STAKE]" and
 [FIX] UTF-8 stdout. The original crashed with "'charmap' codec can't encode"
       on Windows when printing emoji. The crash happened AFTER the result was
       counted but BEFORE release(), so the bot stayed locked on an already
-      resolved contract and the timeout watchdog then booked phantom
+      resolved contract an d the timeout watchdog then booked phantom
       ASSUMED LOSSES for it (doubling the stake and corrupting the threshold
       ledger). Output is now forced to UTF-8 with errors="replace".
 [FIX] assume_loss / timeout watchdog never act on a contract that is already
@@ -102,7 +102,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
-TARGET_PL = 3000.0
+TARGET_PL = 666615.0
 
 # [STAKE] "martingale" = original behaviour (x multiplier + RECOVERY sizing).
 #         "bold"       = size every stake so a single win reaches TARGET_PL.
@@ -149,8 +149,8 @@ LONG_LOSS_GUARD_MIN_EDGE = 0.10  # supported direction must lead by 10 percentag
 # same-type outstanding losses use 2.0, 2.5, and 3.5 points; later losses add
 # one point to the last factor. Configure these values to change the schedule.
 # [DIRECTION] Applied independently inside each direction's ledger.
-THRESHOLD_LOSS_FACTORS = (2.0, 2.5, 3.5)
-THRESHOLD_FACTOR_INCREMENT = 1.0
+THRESHOLD_LOSS_FACTORS = (3.0, 3.5, 4.5)
+THRESHOLD_FACTOR_INCREMENT = 2.0
 THRESHOLD_MIN = 20.0
 THRESHOLD_MAX = 90.0
 THRESHOLD_PRECISION = 6
@@ -369,7 +369,7 @@ class InversionBucket:
         self.last_threshold_change = None
 
 
-# --------------------------------------------------------------------------- #
+# ------------------------------ --------------------------------------------- #
 # Bot
 # --------------------------------------------------------------------------- #
 class Bot:
