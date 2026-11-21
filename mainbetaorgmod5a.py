@@ -29,9 +29,9 @@ reporting and logging are unchanged. Changes (search "[FIX]", "[STAKE]" and
 [STAKE] Optional STAKE_MODE = "bold": each stake is sized so that ONE win
       lands the session at TARGET_PL (capped by MAX_STAKE and the balance).
       Default is "martingale" (the original behaviour).
-[STREAKS] Live histogram of loss-streak lengths; the three longest lengths
-      reached are shown in each trade report as
-      [LOSS STREAK 9: 3 times] [LOSS STREAK 8: 4 times] ...
+[STREAKS] Live histograms of loss-streak and win-streak lengths; the three
+      longest lengths of each are shown in every trade report as
+      LS 9x3 8x4 7x8 | WS 5x2 4x3 3x6  (length x times occurred)
 [RUNTIME] Every tick line shows how long the program has been running.
 
 Honest note: the tick data show no exploitable continuation/reversal edge on
@@ -106,7 +106,7 @@ BASE_STAKE = 1
 MARTINGALE_MULTIPLIER = 2
 MAX_MARTINGALE_STEPS = 10
 MAX_STAKE = 1500.0
-TARGET_PL = 666615.0
+TARGET_PL = 50.0
 
 # [STAKE] "martingale" = original behaviour (x multiplier + RECOVERY sizing).
 #         "bold"       = size every stake so a single win reaches TARGET_PL.
@@ -408,6 +408,7 @@ class Bot:
         self.basket = 0.0
         self.min_bankroll = BASE_STAKE  # [RECOVERY] peak (deficit + next stake)
         self.loss_streak_counts = {}  # [STREAKS] streak length -> times occurred
+        self.win_streak_counts = {}  # [STREAKS] streak length -> times occurred
 
         # [INVERT] / [DIRECTION] one independent inversion bucket per streak
         # direction. contract_id -> immutable original/executed/inverted/direction
@@ -428,27 +429,36 @@ class Bot:
 
     # [RUNTIME] ---------------------------------------------------------
     def uptime_text(self):
-        """Elapsed program run time as HH:MM:SS."""
+        """Elapsed program run time as a duration, e.g. '1h 02m 05s'."""
         s = int(time.monotonic() - self.start_time)
-        return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+        d, s = divmod(s, 86400)
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        return (f"{d}d " if d else "") + f"{h}h {m:02d}m {s:02d}s"
 
     # [STREAKS] ---------------------------------------------------------
-    def count_loss_streak(self, previous, current):
-        """Move one streak from length `previous` to `current` in the histogram."""
+    @staticmethod
+    def count_streak(counts, previous, current):
+        """Move one streak from length `previous` to `current` in a histogram."""
         if previous > 0:
-            left = self.loss_streak_counts.get(previous, 0) - 1
+            left = counts.get(previous, 0) - 1
             if left > 0:
-                self.loss_streak_counts[previous] = left
+                counts[previous] = left
             else:
-                self.loss_streak_counts.pop(previous, None)
-        self.loss_streak_counts[current] = self.loss_streak_counts.get(current, 0) + 1
+                counts.pop(previous, None)
+        counts[current] = counts.get(current, 0) + 1
 
-    def loss_streak_text(self):
-        """Three longest loss-streak lengths reached, with their counts."""
-        top = sorted(self.loss_streak_counts.items(), reverse=True)[:3]
-        return " ".join(
-            f"[LOSS STREAK {n}: {c} time{'s' if c != 1 else ''}]" for n, c in top
-        )
+    def streak_line(self):
+        """e.g. 'LS 9x3 8x4 7x8 | WS 5x2 4x3 3x6' (length x times, top three)."""
+        parts = []
+        for label, counts in (
+            ("LS", self.loss_streak_counts),
+            ("WS", self.win_streak_counts),
+        ):
+            if counts:
+                top = sorted(counts.items(), reverse=True)[:3]
+                parts.append(f"{label} " + " ".join(f"{n}x{c}" for n, c in top))
+        return " | ".join(parts)
 
     @staticmethod
     def _bucket_text(label, bucket):
@@ -824,17 +834,13 @@ class Bot:
         print(f"   Executed signal: {meta['executed']}")
         print(f"   Inverted: {'YES' if meta['inverted'] else 'NO'}")
         print(f"   Actual outcome: {outcome}")
-        print(
-            f"   [{direction}] Real Win Rate: {_rate_text(b.real_wins, b.real_losses)}"
-        )
+        print(f"   [{direction}] Real Win Rate: {_rate_text(b.real_wins, b.real_losses)}")
         print(
             f"   [{direction}] Virtual Win Rate (ALL): "
             f"{_rate_text(b.virtual_wins, b.virtual_losses)}"
         )
         print(f"   [{direction}] Inverted Trades: {b.inv_wins}W {b.inv_losses}L")
-        print(
-            f"   [{direction}] Non-Inverted Trades: {b.noninv_wins}W {b.noninv_losses}L"
-        )
+        print(f"   [{direction}] Non-Inverted Trades: {b.noninv_wins}W {b.noninv_losses}L")
         print(f"   Cumulative (all directions): {self.wins}W {self.losses}L")
         print(f"   [{direction}] Baseline Threshold: {_pct_text(b.baseline_threshold)}")
         print(f"   [{direction}] Active Threshold: {_pct_text(b.active_threshold)}")
@@ -850,9 +856,7 @@ class Bot:
             f"   [{direction}] Unreversed Inverted Losses: "
             f"{self.threshold_unreversed_losses(direction, True)}"
         )
-        print(
-            f"   [{direction}] Last Adjustment: {self.threshold_change_text(direction)}"
-        )
+        print(f"   [{direction}] Last Adjustment: {self.threshold_change_text(direction)}")
         if rate is None:
             reason = "no resolved virtual outcomes"
         elif rate <= b.active_threshold - INVERSION_HYSTERESIS_GAP:
@@ -1250,10 +1254,7 @@ class Bot:
         await self.check_unresolved_timeout(st, symbol)
 
         if prev is None:
-            print(
-                f"{timestamp(epoch)} | RUN {self.uptime_text()} | "
-                f"{symbol} | {price} | Waiting"
-            )
+            print(f"RUN {self.uptime_text()} | {symbol} | {price} | Waiting")
             return
 
         logs = []
@@ -1367,9 +1368,7 @@ class Bot:
                 if inverted and not inversion_requested:
                     note += " | (executed opposite of original via LONG-LOSS GUARD)"
                 elif inversion_requested and not inverted:
-                    note += (
-                        " | (inversion overridden back to original by LONG-LOSS GUARD)"
-                    )
+                    note += " | (inversion overridden back to original by LONG-LOSS GUARD)"
                 if guard is not None:
                     support_text = (
                         "n/a"
@@ -1405,7 +1404,7 @@ class Bot:
 
         if PRINT_TICKS or note:
             logs.append(
-                f"{timestamp(epoch)} [{self.reconnects}] | RUN {self.uptime_text()} | "
+                f"RUN {self.uptime_text()} [{self.reconnects}] | "
                 f"{symbol} | {price:.2f} | "
                 f"{direction:<4} [{st.count}]{note}"
             )
@@ -1437,7 +1436,7 @@ class Bot:
                     "basis": "stake",
                     "contract_type": contract_type,
                     "currency": CURRENCY,
-                    "duration": 2,
+                    "duration": 1,
                     "duration_unit": "t",
                     "underlying_symbol": symbol,
                 },
@@ -1698,8 +1697,8 @@ class Bot:
                 f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
             )
             print(f"   Segment: {self.segment_text(st)}")
-            if self.loss_streak_counts:  # [STREAKS]
-                print(f"   {self.loss_streak_text()}")
+            if self.streak_line():  # [STREAKS]
+                print(f"   {self.streak_line()}")
             print("==========================================")
             print(f"   Min bankroll: {self.min_bankroll:.2f} USD ")
             print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
@@ -1804,7 +1803,11 @@ class Bot:
 
         if status == "won":
             self.wins += 1
+            prev_win_streak = self.win_streak  # [STREAKS]
             self.win_streak += 1
+            self.count_streak(  # [STREAKS]
+                self.win_streak_counts, prev_win_streak, self.win_streak
+            )
             self.loss_streak = 0
             self.longest_win = max(self.longest_win, self.win_streak)
             traded_stake = self.stake  # stake of the trade that just won
@@ -1833,7 +1836,9 @@ class Bot:
             self.losses += 1
             prev_loss_streak = self.loss_streak  # [STREAKS]
             self.loss_streak += 1
-            self.count_loss_streak(prev_loss_streak, self.loss_streak)  # [STREAKS]
+            self.count_streak(  # [STREAKS]
+                self.loss_streak_counts, prev_loss_streak, self.loss_streak
+            )
             self.win_streak = 0
             self.longest_loss = max(self.longest_loss, self.loss_streak)
 
@@ -1953,8 +1958,8 @@ class Bot:
                 f"   Win rate: {win_rate:.0f}% {self.wins}W {self.losses}L     [MINPL {self.min_pl:.2f}]"
             )
             print(f"   Segment: {seg_text}")  # [SEGMENT]
-            if self.loss_streak_counts:  # [STREAKS]
-                print(f"   {self.loss_streak_text()}")
+            if self.streak_line():  # [STREAKS]
+                print(f"   {self.streak_line()}")
             print("==========================================")
             print(f"   Min bankroll: {min_bankroll:.2f} USD ")
             print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
