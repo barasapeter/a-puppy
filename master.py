@@ -464,8 +464,11 @@ class Bot:
                 "active_threshold": b.active_threshold,
                 "inversion_mode": b.inversion_mode,
             }
+        st0 = self.symbols.get(SYMBOLS[0])
         return {
             "uptime": self.uptime_text(),
+            "lookahead": self.lookahead,
+            "segment": self.segment_text(st0) if st0 is not None else "n/a",
             "wins": self.wins,
             "losses": self.losses,
             "unresolved": self.unresolved,
@@ -511,19 +514,22 @@ class Bot:
 
     async def client_handler(self, ws, *_):
         """One connected child: authenticate, send a snapshot, then stream events."""
-        if PUBLISH_TOKEN:
-            try:
-                msg = loads(await asyncio.wait_for(ws.recv(), 5))
-                ok = isinstance(msg, dict) and msg.get("token") == PUBLISH_TOKEN
-            except Exception:
-                ok = False
-            if not ok:
-                await ws.close(1008, "unauthorized")
-                return
+        name = "child"
+        ok = not PUBLISH_TOKEN
+        try:
+            msg = loads(await asyncio.wait_for(ws.recv(), 5))
+            if isinstance(msg, dict):
+                name = str(msg.get("name") or name)[:32]
+                ok = not PUBLISH_TOKEN or msg.get("token") == PUBLISH_TOKEN
+        except Exception:
+            pass
+        if not ok:
+            await ws.close(1008, "unauthorized")
+            return
 
         q = asyncio.Queue(maxsize=200)
         self.clients[ws] = q
-        print(f"[PUBLISH] child connected ({len(self.clients)} total)")
+        print(f"[PUBLISH] child '{name}' connected ({len(self.clients)} total)")
         pump = None
         try:
             await ws.send(
@@ -538,7 +544,7 @@ class Bot:
             if pump is not None:
                 pump.cancel()
             self.clients.pop(ws, None)
-            print(f"[PUBLISH] child disconnected ({len(self.clients)} left)")
+            print(f"[PUBLISH] child '{name}' disconnected ({len(self.clients)} left)")
 
     # [STREAKS] ---------------------------------------------------------
     @staticmethod
@@ -1459,6 +1465,7 @@ class Bot:
                             "stake": self.stake,
                             "step": self.mg_step,
                             "tick_idx": st.tick_idx,
+                            "epoch": epoch,
                             "bias_n": decided,
                             "guard": (
                                 None
