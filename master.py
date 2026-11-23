@@ -134,7 +134,8 @@ WIN_LOG_FILE = "win_events.json"  # JSON array, one object per won trade
 TICK_LOG_SIZE = 40  # recent ticks kept in memory for the tape
 
 # [PUBLISH] Live feed for child bots: a local WebSocket server that broadcasts
-# every executed order, every result and the full metrics snapshot.
+# ONLY the final executed signal (CALL / PUT + symbol). Children never see the
+# parent's streaks, thresholds, inversion, stakes, P&L or any other mechanics.
 PUBLISH_ENABLED = True
 PUBLISH_HOST = "127.0.0.1"  # "0.0.0.0" only if the child runs on another machine
 PUBLISH_PORT = 8765
@@ -445,55 +446,12 @@ class Bot:
         return (f"{d}d " if d else "") + f"{h}h {m:02d}m {s:02d}s"
 
     # [PUBLISH] ---------------------------------------------------------
-    def snapshot(self):
-        """All live metrics of this bot, JSON-safe, for child bots."""
-        buckets = {}
-        for d in DIRECTIONS:
-            b = self.inv[d]
-            buckets[d] = {
-                "virtual_rate": self.virtual_rate_pct(d),
-                "virtual_wins": b.virtual_wins,
-                "virtual_losses": b.virtual_losses,
-                "real_wins": b.real_wins,
-                "real_losses": b.real_losses,
-                "inv_wins": b.inv_wins,
-                "inv_losses": b.inv_losses,
-                "noninv_wins": b.noninv_wins,
-                "noninv_losses": b.noninv_losses,
-                "baseline_threshold": b.baseline_threshold,
-                "active_threshold": b.active_threshold,
-                "inversion_mode": b.inversion_mode,
-            }
-        st0 = self.symbols.get(SYMBOLS[0])
-        return {
-            "uptime": self.uptime_text(),
-            "lookahead": self.lookahead,
-            "segment": self.segment_text(st0) if st0 is not None else "n/a",
-            "wins": self.wins,
-            "losses": self.losses,
-            "unresolved": self.unresolved,
-            "net_pl": self.net_pl,
-            "max_pl": self.max_pl,
-            "min_pl": self.min_pl,
-            "stake": self.stake,
-            "mg_step": self.mg_step,
-            "loss_streak": self.loss_streak,
-            "win_streak": self.win_streak,
-            "longest_loss": self.longest_loss,
-            "longest_win": self.longest_win,
-            "streaks": self.streak_line(),
-            "loss_streak_counts": {str(k): v for k, v in self.loss_streak_counts.items()},
-            "win_streak_counts": {str(k): v for k, v in self.win_streak_counts.items()},
-            "buckets": buckets,
-        }
-
     def publish(self, event):
         """Broadcast one event to every connected child. Never blocks, never raises."""
         if not self.clients:
             return
         try:
             event["ts"] = time.time()
-            event["state"] = self.snapshot()
             msg = dumps(event)
             for q in list(self.clients.values()):
                 if q.full():  # slow child: drop its oldest message
@@ -513,7 +471,7 @@ class Bot:
             pass
 
     async def client_handler(self, ws, *_):
-        """One connected child: authenticate, send a snapshot, then stream events."""
+        """One connected child: authenticate, say hello, then stream signals."""
         name = "child"
         ok = not PUBLISH_TOKEN
         try:
@@ -533,7 +491,7 @@ class Bot:
         pump = None
         try:
             await ws.send(
-                dumps({"type": "hello", "ts": time.time(), "state": self.snapshot()})
+                dumps({"type": "hello", "ts": time.time()})
             )
             pump = asyncio.create_task(self._pump(ws, q))
             async for _ in ws:  # children may send acks; they are ignored
@@ -1453,37 +1411,8 @@ class Bot:
                 )
                 if self.order is not None:
                     self.order.long_loss_guard = guard
-                    self.publish(  # [PUBLISH] before any printing
-                        {
-                            "type": "order",
-                            "symbol": symbol,
-                            "direction": direction,
-                            "contract": contract_type,
-                            "original": original_signal,
-                            "inverted": inverted,
-                            "inversion_requested": inversion_requested,
-                            "stake": self.stake,
-                            "step": self.mg_step,
-                            "tick_idx": st.tick_idx,
-                            "epoch": epoch,
-                            "bias_n": decided,
-                            "guard": (
-                                None
-                                if guard is None
-                                else {
-                                    k: guard.get(k)
-                                    for k in (
-                                        "triggered",
-                                        "supported_signal",
-                                        "reason",
-                                        "loss_streak",
-                                        "samples",
-                                        "call_support_rate",
-                                        "put_support_rate",
-                                    )
-                                }
-                            ),
-                        }
+                    self.publish(  # [PUBLISH] bare signal only, before any printing
+                        {"type": "signal", "symbol": symbol, "contract": contract_type}
                     )
 
                 # [LOSSLOG] attach the signal snapshot AFTER the send
@@ -1846,16 +1775,6 @@ class Bot:
             print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
             print("==========================================")
             self.inversion_report(meta, "lost", contract_id)  # [INVERT]
-            self.publish(  # [PUBLISH]
-                {
-                    "type": "result",
-                    "contract_id": contract_id,
-                    "status": "lost",
-                    "profit": profit,
-                    "assumed": True,
-                    "meta": meta,
-                }
-            )
             print()
 
             self.stop_if_target_reached()
@@ -2117,16 +2036,6 @@ class Bot:
             print(f"   Net P&L: {self.net_pl:+.2f} USD     [TGTPL {target_status}]")
             print("==========================================")
             self.inversion_report(meta, status, contract_id)  # [INVERT]
-            self.publish(  # [PUBLISH]
-                {
-                    "type": "result",
-                    "contract_id": contract_id,
-                    "status": status,
-                    "profit": profit,
-                    "assumed": False,
-                    "meta": meta,
-                }
-            )
             print()
 
             self.stop_if_target_reached()
