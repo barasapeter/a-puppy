@@ -150,17 +150,21 @@ BUSY_TIMEOUT_S = 30.0  # unresolved contract: query its status, then give up
 #   (threshold - gap), and goes back to executing it as received when it is at
 #   or above (threshold + gap). Inside that band it keeps its previous mode.
 INVERSION_ENABLED = os.environ.get("CHILD_INVERSION", "on").strip().lower() not in (
-    "off", "0", "false", "no",
+    "off",
+    "0",
+    "false",
+    "no",
 )
 try:
     INVERSION_THRESHOLD = float(os.environ.get("CHILD_THRESHOLD", 46.0))  # base, %
 except ValueError:
     sys.exit("Invalid CHILD_THRESHOLD (must be a number between 0 and 100).")
 INVERSION_HYSTERESIS_GAP = 3  # percentage points either side of the threshold
-# The threshold itself adapts (same mechanics as the parent): every real loss
-# moves it by a factor (up if the trade was NOT inverted, down if it was), every
-# win reverses the matching earlier loss. First three outstanding losses of one
-# type use these factors; each further one adds the increment.
+# Every resolved outcome adjusts the threshold. A loss moves it up when the
+# trade was NOT inverted and down when it was. A win reverses the newest
+# outstanding loss of the same type; if none exists, it applies the opposite
+# directional adjustment itself. First three outstanding adjustments of a type
+# use these factors; each further one adds the increment.
 THRESHOLD_LOSS_FACTORS = (3.0, 3.5, 4.5)
 THRESHOLD_FACTOR_INCREMENT = 2.0
 THRESHOLD_MIN = 20.0
@@ -271,9 +275,7 @@ class AdaptiveInversion:
 
     # ----------------------------------------------------------- threshold
     def _reversed_ids(self):
-        return {
-            e["reverses_event_id"] for e in self.ledger if e["kind"] == "reversal"
-        }
+        return {e["reverses_event_id"] for e in self.ledger if e["kind"] == "reversal"}
 
     def unreversed_losses(self, inverted):
         reversed_ids = self._reversed_ids()
@@ -294,20 +296,33 @@ class AdaptiveInversion:
             + THRESHOLD_FACTOR_INCREMENT * (position - len(THRESHOLD_LOSS_FACTORS))
         )
 
-    def _recompute(self):
-        raw = self.baseline_threshold + sum(float(e["delta"]) for e in self.ledger)
-        self.active_threshold = _round_pct(min(THRESHOLD_MAX, max(THRESHOLD_MIN, raw)))
+    def _apply_delta(self, delta):
+        """Apply an adjustment to the current threshold, respecting its bounds."""
+        before = self.active_threshold
+        self.active_threshold = _round_pct(
+            min(THRESHOLD_MAX, max(THRESHOLD_MIN, before + float(delta)))
+        )
+        return _round_pct(self.active_threshold - before)
+
+    def _unreversed_win_adjustments(self, inverted):
+        reversed_ids = self._reversed_ids()
+        return sum(
+            1
+            for e in self.ledger
+            if e["kind"] == "win_adjustment"
+            and e["inverted"] is bool(inverted)
+            and e["event_id"] not in reversed_ids
+        )
 
     def _update_threshold(self, inverted, won):
-        """Append one real outcome to the ledger (events are never edited)."""
+        """Apply an adjustment for every resolved win or loss."""
         inverted = bool(inverted)
-        before = self.active_threshold
         self.event_id += 1
         reversed_ids = self._reversed_ids()
 
         if won:
             match = None
-            for e in reversed(self.ledger):  # newest unreversed loss of this type
+            for e in reversed(self.ledger):
                 if (
                     e["kind"] == "loss"
                     and e["inverted"] is inverted
@@ -315,65 +330,76 @@ class AdaptiveInversion:
                 ):
                     match = e
                     break
-            if match is None:
+
+            if match is not None:
+                intended = -float(match["delta"])
+                actual = self._apply_delta(intended)
                 self.ledger.append(
                     {
                         "event_id": self.event_id,
-                        "kind": "win_no_match",
+                        "kind": "reversal",
                         "inverted": inverted,
-                        "delta": 0.0,
-                        "reverses_event_id": None,
+                        "delta": actual,
+                        "intended": intended,
+                        "factor": float(match["factor"]),
+                        "reverses_event_id": match["event_id"],
+                        "position": match["position"],
                     }
                 )
                 self.last_change = {
-                    "kind": "win_no_match",
-                    "change": 0.0,
-                    "intended": 0.0,
+                    "kind": "reversal",
+                    "change": actual,
+                    "intended": intended,
                     "entry_inverted": inverted,
-                    "position": 0,
+                    "position": match["position"],
+                    "factor": float(match["factor"]),
                 }
                 return
-            delta = -float(match["delta"])
+
+            position = self._unreversed_win_adjustments(inverted) + 1
+            factor = self._factor(position)
+            intended = factor if inverted else -factor
+            actual = self._apply_delta(intended)
             self.ledger.append(
                 {
                     "event_id": self.event_id,
-                    "kind": "reversal",
+                    "kind": "win_adjustment",
                     "inverted": inverted,
-                    "delta": delta,
-                    "factor": float(match["factor"]),
-                    "reverses_event_id": match["event_id"],
-                    "position": match["position"],
+                    "delta": actual,
+                    "intended": intended,
+                    "factor": factor,
+                    "position": position,
                 }
             )
-            self._recompute()
             self.last_change = {
-                "kind": "reversal",
-                "change": _round_pct(self.active_threshold - before),
-                "intended": delta,
+                "kind": "win_adjustment",
+                "change": actual,
+                "intended": intended,
                 "entry_inverted": inverted,
-                "position": match["position"],
-                "factor": float(match["factor"]),
+                "position": position,
+                "factor": factor,
             }
             return
 
         position = self.unreversed_losses(inverted) + 1
         factor = self._factor(position)
-        delta = -factor if inverted else factor
+        intended = -factor if inverted else factor
+        actual = self._apply_delta(intended)
         self.ledger.append(
             {
                 "event_id": self.event_id,
                 "kind": "loss",
                 "inverted": inverted,
-                "delta": delta,
+                "delta": actual,
+                "intended": intended,
                 "factor": factor,
                 "position": position,
             }
         )
-        self._recompute()
         self.last_change = {
             "kind": "loss",
-            "change": _round_pct(self.active_threshold - before),
-            "intended": delta,
+            "change": actual,
+            "intended": intended,
             "entry_inverted": inverted,
             "position": position,
             "factor": factor,
@@ -394,7 +420,9 @@ class AdaptiveInversion:
             return f"{_signed_pct_text(change)}{clamp} (loss #{info['position']}, {side}: factor {info['factor']:g})"
         if info["kind"] == "reversal":
             return f"{_signed_pct_text(change)}{clamp} (win reversed loss #{info['position']} {side} factor {info['factor']:g})"
-        return f"0.0% (win: no unreversed {side} loss exists)"
+        if info["kind"] == "win_adjustment":
+            return f"{_signed_pct_text(change)}{clamp} (win adjustment #{info['position']}, {side}: factor {info['factor']:g})"
+        return f"{_signed_pct_text(change)}{clamp}"
 
     # ------------------------------------------------------------- results
     def record_result(self, order, status):
@@ -440,13 +468,10 @@ class Reporter:
         decided = c.wins + c.losses
         win_rate = c.wins / decided * 100 if decided else 0
 
-        target_status = (
-            f"✅ [1] [BSKT {c.net_pl:.2f} USD]" if c.tp_reached else "⏰"
-        )
+        target_status = f"✅ [1] [BSKT {c.net_pl:.2f} USD]" if c.tp_reached else "⏰"
         emoji = "❗" * c.loss_streak if status == "lost" else "🏆" * c.win_streak
         emoji += (
-            f" [C{'L' if c.loss_streak else 'W'}S "
-            f"{c.loss_streak or c.win_streak}]"
+            f" [C{'L' if c.loss_streak else 'W'}S " f"{c.loss_streak or c.win_streak}]"
         )
 
         print(
@@ -604,9 +629,7 @@ class Child:
             self.wins += 1
             prev_win_streak = self.win_streak
             self.win_streak += 1
-            self.count_streak(
-                self.win_streak_counts, prev_win_streak, self.win_streak
-            )
+            self.count_streak(self.win_streak_counts, prev_win_streak, self.win_streak)
             self.loss_streak = 0
             self.longest_win = max(self.longest_win, self.win_streak)
             traded_stake = self.stake  # stake of the trade that just won
@@ -651,7 +674,10 @@ class Child:
         symbol = ev.get("symbol")
         if self.stop.is_set() or signal not in ("CALL", "PUT") or not symbol:
             return
-        if MAX_EVENT_AGE_S is not None and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S:
+        if (
+            MAX_EVENT_AGE_S is not None
+            and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S
+        ):
             print(f"[Parent Active] Signal {signal} ignored (stale)")
             return
         if self.ws is None:
