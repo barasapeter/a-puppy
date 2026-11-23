@@ -13,8 +13,41 @@ child simply executes it on its own Deriv connection.
 * REPORTING: one compact report per resolved trade, plus a one-line status
   such as "[Parent Active] Waiting for signal...".
 
-Run the parent first (it hosts the feed), then:   python child_bot.py [NAME] [TP]
-  e.g.   python child_bot.py alpha 25      (child "alpha", stop at +25 USD)
+USAGE
+    python child_bot.py [NAME] [TP]
+    python child_bot.py --help
+
+COMMAND-LINE ARGUMENTS  (both optional, positional, in this order)
+    NAME         Label for this child, shown in the parent's log.
+                 Default: $CHILD_NAME, otherwise a random "child-xxxx".
+    TP           Take profit in USD. The child stops once its own net P&L
+                 reaches it (the parent and other children keep running).
+                 Default: $CHILD_TP, otherwise 666615.
+    -h, --help   Show this help and exit.
+
+    Examples
+        python child_bot.py                 random name, default TP
+        python child_bot.py alpha           named "alpha", default TP
+        python child_bot.py alpha 25        named "alpha", stops at +25 USD
+
+ENVIRONMENT VARIABLES  (all optional)
+    CHILD_NAME           Same as NAME  (the command-line argument wins).
+    CHILD_TP             Same as TP    (the command-line argument wins).
+    CHILD_STAKE_MODE     "martingale" (default) or "fixed".
+    CHILD_ACCOUNT_TYPE   Account type passed to auth.get_ws_url (default "demo").
+    DERIV_CHILD_WS_URL   Full Deriv WebSocket URL. Overrides get_ws_url, so a
+                         child can trade on a different account / token.
+
+    Setting them on Windows
+        cmd:         set CHILD_STAKE_MODE=fixed
+                     python child_bot.py alpha 25
+        PowerShell:  $env:CHILD_STAKE_MODE = "fixed"; python child_bot.py alpha 25
+
+Everything else (parent URL and token, stake sizes, martingale, loss limit)
+is a constant in the CONFIGURATION section of this file.
+
+Run the parent first (it hosts the feed), then start each child in its own
+terminal.
 """
 
 import asyncio
@@ -50,6 +83,12 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    print(__doc__)
+    sys.exit(0)
+if len(sys.argv) > 3:
+    sys.exit("Too many arguments. Usage: python child_bot.py [NAME] [TP]  (see --help)")
+
 # Name shown in the parent's log: `python child_bot.py alpha` or CHILD_NAME=alpha
 NAME = (
     sys.argv[1]
@@ -59,9 +98,12 @@ NAME = (
 
 # This child's take profit (net P&L in USD at which it stops):
 # `python child_bot.py alpha 25`, or CHILD_TP=25, or the default below.
-TARGET_PL = float(
-    sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CHILD_TP", 15.0)
-)
+try:
+    TARGET_PL = float(
+        sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CHILD_TP", 666615.0)
+    )
+except ValueError:
+    sys.exit("Invalid TP (must be a number). Usage: python child_bot.py [NAME] [TP]")
 
 PARENT_URL = "ws://127.0.0.1:8765"  # must match PUBLISH_HOST / PUBLISH_PORT
 PARENT_TOKEN = "change-me"  # must match PUBLISH_TOKEN ("" if the parent has none)
@@ -112,36 +154,83 @@ def _to_float(value):
 # Reporting interface
 # --------------------------------------------------------------------------- #
 class Reporter:
-    """Compact report of one resolved child trade."""
+    """Friendly report of one resolved child trade: this trade, then the session."""
+
+    WIDTH = 46
 
     def __init__(self, child):
         self.c = child
 
-    def resolved(self, contract_id, status, profit):
+    @staticmethod
+    def _row(label, value):
+        print(f" {label:<16}{value}")
+
+    @staticmethod
+    def _n(n, singular, plural):
+        return f"{n} {singular if n == 1 else plural}"
+
+    @staticmethod
+    def _signed(value):
+        return "0.00" if abs(value) < 0.005 else f"{value:+.2f}"
+
+    def resolved(self, poc, contract_id, status, profit, order):
         c = self.c
-        decided = c.wins + c.losses
-        win_rate = c.wins / decided * 100 if decided else 0
-        target_status = f"✅ [1] [BSKT {c.net_pl:.2f} USD]" if c.tp_reached else "⏰"
-        emoji = "❗" * c.loss_streak if status == "lost" else "🏆" * c.win_streak
-        emoji += (
-            f" [C{'L' if c.loss_streak else 'W'}S " f"{c.loss_streak or c.win_streak}]"
+        order = order or {}
+        trade_no = c.wins + c.losses
+        win_rate = c.wins / trade_no * 100 if trade_no else 0
+        icon, word = {"won": ("✅", "WON"), "lost": ("❌", "LOST")}.get(
+            status, ("⚠️", str(status).upper())
+        )
+        bar = "─" * self.WIDTH
+
+        # current streak indicator, same as the parent: 🏆🏆🏆 [CWS 3] / ❗❗ [CLS 2]
+        marks = "❗" * c.loss_streak if status == "lost" else "🏆" * c.win_streak
+        marks += (
+            f" [C{'L' if c.loss_streak else 'W'}S "
+            f"{c.loss_streak or c.win_streak}]"
         )
 
-        print(f"\n==========================================={emoji}")
-        print(f"   TRADE RESOLVED | ID: {contract_id}    [URSVD {c.unresolved}]")
-        print(
-            f"   Result: {str(status).upper()}  MXLS{c.longest_loss} MXWS{c.longest_win}"
+        if c.tp_reached:
+            tp = "TP REACHED 🎯"
+        else:
+            pct = max(0.0, c.net_pl) / TARGET_PL * 100
+            tp = f"{pct:.0f}% of the {TARGET_PL:.2f} USD TP"
+
+        entry = poc.get("entry_spot")
+        exit_ = poc.get("exit_spot")
+        stake = order.get("stake")
+
+        print()
+        print(bar)
+        print(f" {icon} {word}  {profit:+.2f} USD    ·    Trade #{trade_no}")
+        print(f" {marks}")
+        print(bar)
+        self._row("Contract", contract_id)
+        self._row(
+            "Signal", f"{order.get('signal', 'n/a')} on {order.get('symbol', 'n/a')}"
         )
-        print(f"   Current P&L: {profit:+.2f} USD MXPL {c.max_pl:.2f}")
-        print(
-            f"   Win rate: {win_rate:.0f}% {c.wins}W {c.losses}L     [MINPL {c.min_pl:.2f}]"
+        self._row("Stake", "n/a" if stake is None else f"{stake:.2f} USD")
+        self._row(
+            "Entry -> Exit",
+            f"{entry if entry is not None else 'n/a'} -> {exit_ if exit_ is not None else 'n/a'}",
         )
-        if c.streak_line():
-            print(f"   {c.streak_line()}")
-        print("==========================================")
-        print(f"   Min bankroll: {c.min_bankroll:.2f} USD ")
-        print(f"   Net P&L: {c.net_pl:+.2f} USD     [TGTPL {target_status}]")
-        print("==========================================")
+        self._row("Next stake", f"{c.decide_stake():.2f} USD")
+        print()
+        print(" SESSION")
+        self._row("Net P&L", f"{c.net_pl:+.2f} USD   ({tp})")
+        self._row("Record", f"{c.wins}W {c.losses}L   ({win_rate:.0f}% win rate)")
+        self._row(
+            "Longest run",
+            f"{self._n(c.longest_win, 'win', 'wins')}"
+            f" / {self._n(c.longest_loss, 'loss', 'losses')}",
+        )
+        self._row("P&L range", f"low {self._signed(c.min_pl)}   /   peak {self._signed(c.max_pl)}")
+        self._row("Bankroll needed", f"{c.min_bankroll:.2f} USD")
+        if c.unresolved:
+            self._row("Unresolved", f"{c.unresolved} (result never received)")
+        if c.streak_line():  # same LS / WS line as the parent
+            self._row("Streaks", c.streak_line())
+        print(bar)
         print()
 
 
@@ -161,8 +250,8 @@ class Child:
         self.busy_since = 0.0
         self.query_tries = 0
         self.resolved = set()
-        self.pending_stake = None  # stake of the order just sent
-        self.stakes = {}  # contract_id -> stake until the contract resolves
+        self.pending_order = None  # signal / symbol / stake of the order just sent
+        self.orders = {}  # contract_id -> that info until the contract resolves
 
         # money management + statistics: fresh per process, never shared
         self.stake = BASE_STAKE
@@ -186,7 +275,7 @@ class Child:
         self.busy = False
         self.contract_id = None
         self.query_tries = 0
-        self.pending_stake = None
+        self.pending_order = None
 
     def set_state(self, text):
         """Print the child's status line only when it changes."""
@@ -242,7 +331,9 @@ class Child:
             self.wins += 1
             prev_win_streak = self.win_streak
             self.win_streak += 1
-            self.count_streak(self.win_streak_counts, prev_win_streak, self.win_streak)
+            self.count_streak(
+                self.win_streak_counts, prev_win_streak, self.win_streak
+            )
             self.loss_streak = 0
             self.longest_win = max(self.longest_win, self.win_streak)
             traded_stake = self.stake  # stake of the trade that just won
@@ -287,10 +378,7 @@ class Child:
         symbol = ev.get("symbol")
         if self.stop.is_set() or signal not in ("CALL", "PUT") or not symbol:
             return
-        if (
-            MAX_EVENT_AGE_S is not None
-            and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S
-        ):
+        if MAX_EVENT_AGE_S is not None and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S:
             print(f"[Parent Active] Signal {signal} ignored (stale)")
             return
         if self.ws is None:
@@ -309,7 +397,7 @@ class Child:
         self.contract_id = None
         self.busy_since = time.monotonic()
         self.query_tries = 0
-        self.pending_stake = stake
+        self.pending_order = {"signal": signal, "symbol": symbol, "stake": stake}
         await self.send(
             {
                 "buy": "1",
@@ -340,8 +428,8 @@ class Child:
             self.show_idle()
             return
         self.contract_id = int(cid)
-        self.stakes[self.contract_id] = self.pending_stake
-        self.pending_stake = None
+        self.orders[self.contract_id] = self.pending_order
+        self.pending_order = None
         await self.send(
             {
                 "proposal_open_contract": 1,
@@ -367,15 +455,15 @@ class Child:
 
             status = poc.get("status")
             profit = float(poc.get("profit", 0.0))
-            used_stake = self.stakes.pop(cid, None)
+            order = self.orders.pop(cid, None)
 
             self.apply_result(status, profit)
-            if STAKE_MODE == "fixed" and used_stake is not None:
-                self.stake = used_stake  # the stake actually used
+            if STAKE_MODE == "fixed" and order is not None:
+                self.stake = order["stake"]  # the stake actually used
             self.update_min_bankroll()
 
             self.tp_reached = self.net_pl >= TARGET_PL
-            self.reporter.resolved(cid, status, profit)
+            self.reporter.resolved(poc, cid, status, profit, order)
 
             if self.tp_reached:
                 print(
