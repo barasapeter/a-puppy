@@ -10,6 +10,10 @@ child simply executes it on its own Deriv connection.
   or with other children, and nothing is saved to disk.
 * TAKE PROFIT: each child has its own TP. When the child's net P&L reaches it,
   that child stops trading and exits; the parent and other children keep running.
+* ADAPTIVE INVERSION: the child tracks a "virtual win rate" (how the parent's
+  signals would have done if executed as received) and inverts the parent's
+  signal while that rate is below an adaptive threshold, with a hysteresis gap
+  so it does not flip-flop. The child only ever sees the final CALL / PUT.
 * REPORTING: one compact report per resolved trade, plus a one-line status
   such as "[Parent Active] Waiting for signal...".
 
@@ -34,6 +38,8 @@ ENVIRONMENT VARIABLES  (all optional)
     CHILD_NAME           Same as NAME  (the command-line argument wins).
     CHILD_TP             Same as TP    (the command-line argument wins).
     CHILD_STAKE_MODE     "martingale" (default) or "fixed".
+    CHILD_INVERSION      "on" (default) or "off": adaptive signal inversion.
+    CHILD_THRESHOLD      Base inversion threshold in percent (default 46).
     CHILD_ACCOUNT_TYPE   Account type passed to auth.get_ws_url (default "demo").
     DERIV_CHILD_WS_URL   Full Deriv WebSocket URL. Overrides get_ws_url, so a
                          child can trade on a different account / token.
@@ -100,7 +106,7 @@ NAME = (
 # `python child_bot.py alpha 25`, or CHILD_TP=25, or the default below.
 try:
     TARGET_PL = float(
-        sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CHILD_TP", 15.0)
+        sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CHILD_TP", 666615.0)
     )
 except ValueError:
     sys.exit("Invalid TP (must be a number). Usage: python child_bot.py [NAME] [TP]")
@@ -135,12 +141,47 @@ MAX_EVENT_AGE_S = 5.0  # ignore signals older than this (None = off);
 #                       needs synced clocks if the parent is on another machine
 BUSY_TIMEOUT_S = 30.0  # unresolved contract: query its status, then give up
 
+# [INVERSION] adaptive inversion of the parent's final signal.
+#   virtual win rate = how the parent's ORIGINAL signals would have done:
+#     executed as received + won  -> virtual win     executed as received + lost -> virtual loss
+#     inverted by the child + won -> virtual LOSS    inverted by the child + lost -> virtual WIN
+#   (the real win rate ignores inversion entirely)
+#   The child inverts the next signal when the virtual win rate is at or below
+#   (threshold - gap), and goes back to executing it as received when it is at
+#   or above (threshold + gap). Inside that band it keeps its previous mode.
+INVERSION_ENABLED = os.environ.get("CHILD_INVERSION", "on").strip().lower() not in (
+    "off", "0", "false", "no",
+)
+try:
+    INVERSION_THRESHOLD = float(os.environ.get("CHILD_THRESHOLD", 46.0))  # base, %
+except ValueError:
+    sys.exit("Invalid CHILD_THRESHOLD (must be a number between 0 and 100).")
+INVERSION_HYSTERESIS_GAP = 3  # percentage points either side of the threshold
+# The threshold itself adapts (same mechanics as the parent): every real loss
+# moves it by a factor (up if the trade was NOT inverted, down if it was), every
+# win reverses the matching earlier loss. First three outstanding losses of one
+# type use these factors; each further one adds the increment.
+THRESHOLD_LOSS_FACTORS = (3.0, 3.5, 4.5)
+THRESHOLD_FACTOR_INCREMENT = 2.0
+THRESHOLD_MIN = 20.0
+THRESHOLD_MAX = 90.0
+THRESHOLD_PRECISION = 6
+
 REQ_BUY, REQ_POC, REQ_POC_QUERY = 6005, 6007, 6008
 
 if STAKE_MODE not in ("martingale", "fixed"):
     raise ValueError('STAKE_MODE must be "martingale" or "fixed"')
 if TARGET_PL <= 0:
     raise ValueError("take profit (TP) must be positive")
+if not (0.0 <= THRESHOLD_MIN <= INVERSION_THRESHOLD <= THRESHOLD_MAX <= 100.0):
+    raise ValueError(
+        f"base threshold must lie inside the bounds [{THRESHOLD_MIN}, {THRESHOLD_MAX}]"
+    )
+if INVERSION_HYSTERESIS_GAP < 0 or THRESHOLD_FACTOR_INCREMENT < 0:
+    raise ValueError("hysteresis gap and factor increment must be non-negative")
+if not THRESHOLD_LOSS_FACTORS or any(x <= 0 for x in THRESHOLD_LOSS_FACTORS):
+    raise ValueError("THRESHOLD_LOSS_FACTORS must contain positive numbers")
+INVERSE_SIGNAL = {"PUT": "CALL", "CALL": "PUT"}
 
 
 def _to_float(value):
@@ -148,6 +189,240 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive inversion (final CALL / PUT only: one bucket, no direction logic)
+# --------------------------------------------------------------------------- #
+def _rate_text(wins, losses):
+    total = wins + losses
+    if not total:
+        return f"n/a ({wins}W {losses}L)"
+    return f"{wins / total * 100:.1f}% ({wins}W {losses}L)"
+
+
+def _round_pct(value):
+    return round(float(value), THRESHOLD_PRECISION)
+
+
+def _pct_text(value):
+    text = f"{value:.4f}".rstrip("0")
+    if text.endswith("."):
+        text += "0"
+    return text + "%"
+
+
+def _signed_pct_text(value):
+    if value == 0:
+        return "0.0%"
+    return ("+" if value > 0 else "-") + _pct_text(abs(value))
+
+
+class AdaptiveInversion:
+    """Adaptive inversion of the parent's final signal, fed ONLY by this
+    child's own resolved trades.
+
+    Virtual outcome of a trade = what the parent's ORIGINAL signal would have
+    done: executed as received -> same as the real outcome; inverted -> the
+    opposite of the real outcome.
+    """
+
+    def __init__(self):
+        self.virtual_wins = self.virtual_losses = 0
+        self.inv_wins = self.inv_losses = 0  # trades the child inverted
+        self.noninv_wins = self.noninv_losses = 0  # trades executed as received
+        self.baseline_threshold = _round_pct(INVERSION_THRESHOLD)
+        self.active_threshold = self.baseline_threshold
+        self.inversion_mode = False
+        self.ledger = []  # append-only threshold events
+        self.event_id = 0
+        self.last_change = None
+
+    # ------------------------------------------------------------ decision
+    def virtual_rate(self):
+        total = self.virtual_wins + self.virtual_losses
+        return None if total == 0 else self.virtual_wins * 100.0 / total
+
+    def decide(self):
+        """True = invert the next signal. Hysteresis on the virtual win rate."""
+        rate = self.virtual_rate()
+        if rate is None:
+            self.inversion_mode = False
+        elif rate <= self.active_threshold - INVERSION_HYSTERESIS_GAP:
+            self.inversion_mode = True
+        elif rate >= self.active_threshold + INVERSION_HYSTERESIS_GAP:
+            self.inversion_mode = False
+        return self.inversion_mode  # inside the band: keep the previous mode
+
+    def explain(self):
+        rate = self.virtual_rate()
+        on_b = self.active_threshold - INVERSION_HYSTERESIS_GAP
+        off_b = self.active_threshold + INVERSION_HYSTERESIS_GAP
+        if rate is None:
+            return "no resolved outcomes yet"
+        if rate <= on_b:
+            return f"virtual {rate:.1f}% <= ON boundary {on_b:.1f}%"
+        if rate >= off_b:
+            return f"virtual {rate:.1f}% >= OFF boundary {off_b:.1f}%"
+        return (
+            f"hysteresis band {on_b:.1f}%-{off_b:.1f}%; "
+            f"keeping {'INVERT' if self.inversion_mode else 'KEEP'}"
+        )
+
+    # ----------------------------------------------------------- threshold
+    def _reversed_ids(self):
+        return {
+            e["reverses_event_id"] for e in self.ledger if e["kind"] == "reversal"
+        }
+
+    def unreversed_losses(self, inverted):
+        reversed_ids = self._reversed_ids()
+        return sum(
+            1
+            for e in self.ledger
+            if e["kind"] == "loss"
+            and e["inverted"] is bool(inverted)
+            and e["event_id"] not in reversed_ids
+        )
+
+    @staticmethod
+    def _factor(position):
+        if position <= len(THRESHOLD_LOSS_FACTORS):
+            return float(THRESHOLD_LOSS_FACTORS[position - 1])
+        return float(
+            THRESHOLD_LOSS_FACTORS[-1]
+            + THRESHOLD_FACTOR_INCREMENT * (position - len(THRESHOLD_LOSS_FACTORS))
+        )
+
+    def _recompute(self):
+        raw = self.baseline_threshold + sum(float(e["delta"]) for e in self.ledger)
+        self.active_threshold = _round_pct(min(THRESHOLD_MAX, max(THRESHOLD_MIN, raw)))
+
+    def _update_threshold(self, inverted, won):
+        """Append one real outcome to the ledger (events are never edited)."""
+        inverted = bool(inverted)
+        before = self.active_threshold
+        self.event_id += 1
+        reversed_ids = self._reversed_ids()
+
+        if won:
+            match = None
+            for e in reversed(self.ledger):  # newest unreversed loss of this type
+                if (
+                    e["kind"] == "loss"
+                    and e["inverted"] is inverted
+                    and e["event_id"] not in reversed_ids
+                ):
+                    match = e
+                    break
+            if match is None:
+                self.ledger.append(
+                    {
+                        "event_id": self.event_id,
+                        "kind": "win_no_match",
+                        "inverted": inverted,
+                        "delta": 0.0,
+                        "reverses_event_id": None,
+                    }
+                )
+                self.last_change = {
+                    "kind": "win_no_match",
+                    "change": 0.0,
+                    "intended": 0.0,
+                    "entry_inverted": inverted,
+                    "position": 0,
+                }
+                return
+            delta = -float(match["delta"])
+            self.ledger.append(
+                {
+                    "event_id": self.event_id,
+                    "kind": "reversal",
+                    "inverted": inverted,
+                    "delta": delta,
+                    "factor": float(match["factor"]),
+                    "reverses_event_id": match["event_id"],
+                    "position": match["position"],
+                }
+            )
+            self._recompute()
+            self.last_change = {
+                "kind": "reversal",
+                "change": _round_pct(self.active_threshold - before),
+                "intended": delta,
+                "entry_inverted": inverted,
+                "position": match["position"],
+                "factor": float(match["factor"]),
+            }
+            return
+
+        position = self.unreversed_losses(inverted) + 1
+        factor = self._factor(position)
+        delta = -factor if inverted else factor
+        self.ledger.append(
+            {
+                "event_id": self.event_id,
+                "kind": "loss",
+                "inverted": inverted,
+                "delta": delta,
+                "factor": factor,
+                "position": position,
+            }
+        )
+        self._recompute()
+        self.last_change = {
+            "kind": "loss",
+            "change": _round_pct(self.active_threshold - before),
+            "intended": delta,
+            "entry_inverted": inverted,
+            "position": position,
+            "factor": factor,
+        }
+
+    def change_text(self):
+        info = self.last_change
+        if info is None:
+            return "none yet"
+        change, intended = info["change"], info["intended"]
+        clamp = (
+            ""
+            if change == intended
+            else f" (ledger delta {_signed_pct_text(intended)}; threshold bounded)"
+        )
+        side = "inverted" if info["entry_inverted"] else "normal"
+        if info["kind"] == "loss":
+            return f"{_signed_pct_text(change)}{clamp} (loss #{info['position']}, {side}: factor {info['factor']:g})"
+        if info["kind"] == "reversal":
+            return f"{_signed_pct_text(change)}{clamp} (win reversed loss #{info['position']} {side} factor {info['factor']:g})"
+        return f"0.0% (win: no unreversed {side} loss exists)"
+
+    # ------------------------------------------------------------- results
+    def record_result(self, order, status):
+        """Count ONE resolved child trade. `order["inverted"]` was fixed when
+        the order was sent and is never derived from the outcome."""
+        if order is None or status not in ("won", "lost"):
+            return
+        won = status == "won"
+        inverted = bool(order["inverted"])
+
+        # virtual: inverted trades count the opposite of what really happened
+        if won != inverted:
+            self.virtual_wins += 1
+        else:
+            self.virtual_losses += 1
+
+        if inverted:
+            if won:
+                self.inv_wins += 1
+            else:
+                self.inv_losses += 1
+        else:
+            if won:
+                self.noninv_wins += 1
+            else:
+                self.noninv_losses += 1
+
+        self._update_threshold(inverted, won)
 
 
 # --------------------------------------------------------------------------- #
@@ -165,16 +440,24 @@ class Reporter:
         decided = c.wins + c.losses
         win_rate = c.wins / decided * 100 if decided else 0
 
-        target_status = f"✅ [1] [BSKT {c.net_pl:.2f} USD]" if c.tp_reached else "⏰"
+        target_status = (
+            f"✅ [1] [BSKT {c.net_pl:.2f} USD]" if c.tp_reached else "⏰"
+        )
         emoji = "❗" * c.loss_streak if status == "lost" else "🏆" * c.win_streak
         emoji += (
-            f" [C{'L' if c.loss_streak else 'W'}S " f"{c.loss_streak or c.win_streak}]"
+            f" [C{'L' if c.loss_streak else 'W'}S "
+            f"{c.loss_streak or c.win_streak}]"
         )
 
         print(
             f"\nEntry {poc.get('entry_spot')} -> Exit {poc.get('exit_spot')} | "
             f"Buy {poc.get('buy_price', order.get('stake'))} | "
             f"Signal {order.get('signal', 'n/a')}"
+            + (
+                f" (parent {order.get('parent')}, INVERTED)"
+                if order.get("inverted")
+                else ""
+            )
         )
         print(f"==========================================={emoji}")
         print(f"   TRADE RESOLVED | ID: {contract_id}    [URSVD {c.unresolved}]")
@@ -190,8 +473,37 @@ class Reporter:
         print("==========================================")
         print(f"   Min bankroll: {c.min_bankroll:.2f} USD ")
         print(f"   Net P&L: {c.net_pl:+.2f} USD     [TGTPL {target_status}]")
-        print("==========================================\n\n")
+        print("==========================================")
+        self.inversion(order, status)
         print()
+
+    def inversion(self, order, status):
+        """Compact adaptive-inversion block (only when inversion is enabled)."""
+        c = self.c
+        inv = c.inversion
+        if not INVERSION_ENABLED or not order or status not in ("won", "lost"):
+            return
+        mode = "INVERT" if inv.decide() else "KEEP"
+        print("   ---------------- ADAPTIVE INVERSION ----------------")
+        print(
+            f"   Parent signal: {order['parent']} | Executed: {order['signal']} | "
+            f"Inverted: {'YES' if order['inverted'] else 'NO'}"
+        )
+        print(
+            f"   Virtual win rate: {_rate_text(inv.virtual_wins, inv.virtual_losses)}"
+            f" | Real win rate: {_rate_text(c.wins, c.losses)}"
+        )
+        print(
+            f"   Inverted trades: {inv.inv_wins}W {inv.inv_losses}L"
+            f" | Executed as received: {inv.noninv_wins}W {inv.noninv_losses}L"
+        )
+        print(
+            f"   Threshold: {_pct_text(inv.active_threshold)} "
+            f"(base {_pct_text(inv.baseline_threshold)}) | Gap: {INVERSION_HYSTERESIS_GAP}pp"
+        )
+        print(f"   Last adjustment: {inv.change_text()}")
+        print(f"   Next signal: {mode} ({inv.explain()})")
+        print("   ----------------------------------------------------")
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +537,7 @@ class Child:
         self.loss_streak_counts = {}
         self.win_streak_counts = {}
 
+        self.inversion = AdaptiveInversion()  # this child's own inversion state
         self.reporter = Reporter(self)
 
     # ----------------------------------------------------------------- utils
@@ -291,7 +604,9 @@ class Child:
             self.wins += 1
             prev_win_streak = self.win_streak
             self.win_streak += 1
-            self.count_streak(self.win_streak_counts, prev_win_streak, self.win_streak)
+            self.count_streak(
+                self.win_streak_counts, prev_win_streak, self.win_streak
+            )
             self.loss_streak = 0
             self.longest_win = max(self.longest_win, self.win_streak)
             traded_stake = self.stake  # stake of the trade that just won
@@ -336,10 +651,7 @@ class Child:
         symbol = ev.get("symbol")
         if self.stop.is_set() or signal not in ("CALL", "PUT") or not symbol:
             return
-        if (
-            MAX_EVENT_AGE_S is not None
-            and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S
-        ):
+        if MAX_EVENT_AGE_S is not None and time.time() - ev.get("ts", 0) > MAX_EVENT_AGE_S:
             print(f"[Parent Active] Signal {signal} ignored (stale)")
             return
         if self.ws is None:
@@ -348,6 +660,12 @@ class Child:
         if self.busy:
             print(f"[Parent Active] Signal {signal} ignored (trade still open)")
             return
+
+        # adaptive inversion: the parent's signal is the "original" signal
+        parent_signal = signal
+        inverted = INVERSION_ENABLED and self.inversion.decide()
+        if inverted:
+            signal = INVERSE_SIGNAL[parent_signal]
 
         stake = self.decide_stake()
         if STAKE_MODE == "fixed":
@@ -358,7 +676,13 @@ class Child:
         self.contract_id = None
         self.busy_since = time.monotonic()
         self.query_tries = 0
-        self.pending_order = {"signal": signal, "symbol": symbol, "stake": stake}
+        self.pending_order = {
+            "signal": signal,  # what the child executes
+            "parent": parent_signal,  # what the parent sent
+            "inverted": inverted,  # fixed now, never derived from the outcome
+            "symbol": symbol,
+            "stake": stake,
+        }
         await self.send(
             {
                 "buy": "1",
@@ -376,7 +700,9 @@ class Child:
             }
         )
         self.set_state(
-            f"[Parent Active] Signal {signal} received | stake {stake:.2f} | trade open"
+            f"[Parent Active] Signal {parent_signal} received"
+            + (f" -> INVERTED to {signal}" if inverted else "")
+            + f" | stake {stake:.2f} | trade open"
         )
 
     # --------------------------------------------------------- deriv events
@@ -422,6 +748,8 @@ class Child:
             if STAKE_MODE == "fixed" and order is not None:
                 self.stake = order["stake"]  # the stake actually used
             self.update_min_bankroll()
+            if INVERSION_ENABLED:  # the child's own result moves its own threshold
+                self.inversion.record_result(order, status)
 
             self.tp_reached = self.net_pl >= TARGET_PL
             self.reporter.resolved(poc, cid, status, profit, order)
@@ -577,6 +905,13 @@ class Child:
         print(
             f"CHILD {NAME} | fresh session | STAKE_MODE={STAKE_MODE} | "
             f"TP=+{TARGET_PL:.2f} USD | ACCOUNT={CHILD_ACCOUNT_TYPE}"
+        )
+        print(
+            "INVERSION=OFF"
+            if not INVERSION_ENABLED
+            else f"INVERSION=ON | THRESHOLD={INVERSION_THRESHOLD:g}% | "
+            f"GAP={INVERSION_HYSTERESIS_GAP}pp | "
+            f"BOUNDS=[{THRESHOLD_MIN:g}, {THRESHOLD_MAX:g}]"
         )
         tasks = [
             asyncio.create_task(self.deriv_loop()),
