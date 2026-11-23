@@ -159,14 +159,14 @@ try:
     INVERSION_THRESHOLD = float(os.environ.get("CHILD_THRESHOLD", 46.0))  # base, %
 except ValueError:
     sys.exit("Invalid CHILD_THRESHOLD (must be a number between 0 and 100).")
-INVERSION_HYSTERESIS_GAP = 3  # percentage points either side of the threshold
+INVERSION_HYSTERESIS_GAP = 15  # percentage points either side of the threshold
 # Every resolved outcome adjusts the threshold. A loss moves it up when the
 # trade was NOT inverted and down when it was. A win reverses the newest
 # outstanding loss of the same type; if none exists, it applies the opposite
 # directional adjustment itself. First three outstanding adjustments of a type
 # use these factors; each further one adds the increment.
-THRESHOLD_LOSS_FACTORS = (3.0, 3.5, 4.5)
-THRESHOLD_FACTOR_INCREMENT = 2.0
+THRESHOLD_LOSS_FACTORS = (4.0, 4.5, 5.5)
+THRESHOLD_FACTOR_INCREMENT = 3.0
 THRESHOLD_MIN = 20.0
 THRESHOLD_MAX = 90.0
 THRESHOLD_PRECISION = 6
