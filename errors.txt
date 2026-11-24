@@ -1,157 +1,120 @@
-Entry 1718.78 -> Exit 1719.39 | Buy 1.00 | Signal PUT
-===========================================❗ [CLS 1]
-   TRADE RESOLVED | ID: 21592470039    [URSVD 0]
-   Result: LOST  MXLS5 MXWS7
-   Current P&L: -1.00 USD MXPL 16.29
-   Win rate: 48% 27W 29L     [MINPL -24.48]
-   LS 5x1 4x2 2x5 | WS 7x1 4x1 3x2
-==========================================
-   Min bankroll: 56.48 USD 
-   Net P&L: +15.29 USD     [TGTPL ⏰]
-==========================================
-   ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: PUT | Inverted: NO
-   Virtual win rate: 53.6% (30W 26L) | Real win rate: 48.2% (27W 29L)
-   Inverted trades: 4W 7L | Executed as received: 23W 22L
-   Threshold: 54.0% (base 46.0%) | Gap: 3pp
-   Last adjustment: +11.5% (loss #5, normal: factor 11.5)
-   Next signal: KEEP (hysteresis band 51.0%-57.0%; keeping KEEP)
+   Inverted trades: 33W 41L | Executed as received: 32W 43L
+   Threshold: 49.5% (base 46.0%) | Gap: 15pp
+   Last adjustment: +29.5% (loss #11, normal: factor 29.5)
+   Next signal: KEEP (hysteresis band 34.5%-64.5%; keeping KEEP)
    ----------------------------------------------------
 
 [Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received | stake 2.00 | trade open
+[Parent Active] Signal PUT received | stake 8.00 | trade open
 
-Entry 1719.99 -> Exit 1720.27 | Buy 2.00 | Signal PUT
-===========================================❗❗ [CLS 2]
-   TRADE RESOLVED | ID: 21592483959    [URSVD 0]
-   Result: LOST  MXLS5 MXWS7
-   Current P&L: -2.00 USD MXPL 16.29
-   Win rate: 47% 27W 30L     [MINPL -24.48]
-   LS 5x1 4x2 2x6 | WS 7x1 4x1 3x2
-==========================================
-   Min bankroll: 56.48 USD 
-   Net P&L: +13.29 USD     [TGTPL ⏰]
-==========================================
-   ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: PUT | Inverted: NO
-   Virtual win rate: 52.6% (30W 27L) | Real win rate: 47.4% (27W 30L)
-   Inverted trades: 4W 7L | Executed as received: 23W 23L
-   Threshold: 68.5% (base 46.0%) | Gap: 3pp
-   Last adjustment: +14.5% (loss #6, normal: factor 14.5)
-   Next signal: INVERT (virtual 52.6% <= ON boundary 65.5%)
-   ----------------------------------------------------
-
-[Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received -> INVERTED to CALL | stake 4.00 | trade open
-
-Entry 1720.54 -> Exit 1720.41 | Buy 4.00 | Signal CALL (parent PUT, INVERTED)
-===========================================❗❗❗ [CLS 3]
-   TRADE RESOLVED | ID: 21592503159    [URSVD 0]
-   Result: LOST  MXLS5 MXWS7
-   Current P&L: -4.00 USD MXPL 16.29
-   Win rate: 47% 27W 31L     [MINPL -24.48]
-   LS 5x1 4x2 3x1 | WS 7x1 4x1 3x2
-==========================================
-   Min bankroll: 56.48 USD 
-   Net P&L: +9.29 USD     [TGTPL ⏰]
-==========================================
-   ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: CALL | Inverted: YES
-   Virtual win rate: 53.4% (31W 27L) | Real win rate: 46.6% (27W 31L)
-   Inverted trades: 4W 8L | Executed as received: 23W 23L
-   Threshold: 51.0% (base 46.0%) | Gap: 3pp
-   Last adjustment: -17.5% (loss #7, inverted: factor 17.5)
-   Next signal: INVERT (hysteresis band 48.0%-54.0%; keeping INVERT)
-   ----------------------------------------------------
-
-[Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received -> INVERTED to CALL | stake 8.00 | trade open
-
-Entry 1720.69 -> Exit 1720.61 | Buy 8.00 | Signal CALL (parent PUT, INVERTED)
+Entry 1710.51 -> Exit 1710.56 | Buy 8.00 | Signal PUT
 ===========================================❗❗❗❗ [CLS 4]
-   TRADE RESOLVED | ID: 21592521619    [URSVD 0]
-   Result: LOST  MXLS5 MXWS7
-   Current P&L: -8.00 USD MXPL 16.29
-   Win rate: 46% 27W 32L     [MINPL -24.48]
-   LS 5x1 4x3 2x5 | WS 7x1 4x1 3x2
+   TRADE RESOLVED | ID: 21599977659    [URSVD 0]
+   Result: LOST  MXLS7 MXWS6
+   Current P&L: -8.00 USD MXPL 30.23
+   Win rate: 43% 65W 85L     [MINPL -96.77]
+   LS 7x1 6x1 4x4 | WS 6x1 4x1 3x2
 ==========================================
-   Min bankroll: 56.48 USD 
-   Net P&L: +1.29 USD     [TGTPL ⏰]
+   Min bankroll: 224.77 USD 
+   Net P&L: +11.19 USD     [TGTPL ⏰]
 ==========================================
    ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: CALL | Inverted: YES
-   Virtual win rate: 54.2% (32W 27L) | Real win rate: 45.8% (27W 32L)
-   Inverted trades: 4W 9L | Executed as received: 23W 23L
-   Threshold: 30.5% (base 46.0%) | Gap: 3pp
-   Last adjustment: -20.5% (loss #8, inverted: factor 20.5)
-   Next signal: KEEP (virtual 54.2% >= OFF boundary 33.5%)
+   Parent signal: PUT | Executed: PUT | Inverted: NO
+   Virtual win rate: 48.7% (73W 77L) | Real win rate: 43.3% (65W 85L)
+   Inverted trades: 33W 41L | Executed as received: 32W 44L
+   Threshold: 82.0% (base 46.0%) | Gap: 15pp
+   Last adjustment: +32.5% (loss #12, normal: factor 32.5)
+   Next signal: INVERT (virtual 48.7% <= ON boundary 67.0%)
    ----------------------------------------------------
 
 [Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received | stake 16.00 | trade open
+[Parent Active] Signal PUT received -> INVERTED to CALL | stake 16.00 | trade open
 
-Entry 1720.54 -> Exit 1720.70 | Buy 16.00 | Signal PUT
+Entry 1711.66 -> Exit 1711.55 | Buy 16.00 | Signal CALL (parent PUT, INVERTED)
 ===========================================❗❗❗❗❗ [CLS 5]
-   TRADE RESOLVED | ID: 21592534559    [URSVD 0]
-   Result: LOST  MXLS5 MXWS7
-   Current P&L: -16.00 USD MXPL 16.29
-   Win rate: 45% 27W 33L     [MINPL -24.48]
-   LS 5x2 4x2 2x5 | WS 7x1 4x1 3x2
+   TRADE RESOLVED | ID: 21599990339    [URSVD 0]
+   Result: LOST  MXLS7 MXWS6
+   Current P&L: -16.00 USD MXPL 30.23
+   Win rate: 43% 65W 86L     [MINPL -96.77]
+   LS 7x1 6x1 5x1 | WS 6x1 4x1 3x2
 ==========================================
-   Min bankroll: 56.48 USD 
-   Net P&L: -14.71 USD     [TGTPL ⏰]
-==========================================
-   ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: PUT | Inverted: NO
-   Virtual win rate: 53.3% (32W 28L) | Real win rate: 45.0% (27W 33L)
-   Inverted trades: 4W 9L | Executed as received: 23W 24L
-   Threshold: 48.0% (base 46.0%) | Gap: 3pp
-   Last adjustment: +17.5% (loss #7, normal: factor 17.5)
-   Next signal: KEEP (virtual 53.3% >= OFF boundary 51.0%)
-   ----------------------------------------------------
-
-[Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received | stake 32.00 | trade open
-
-Entry 1720.31 -> Exit 1720.37 | Buy 32.00 | Signal PUT
-===========================================❗❗❗❗❗❗ [CLS 6]
-   TRADE RESOLVED | ID: 21592543239    [URSVD 0]
-   Result: LOST  MXLS6 MXWS7
-   Current P&L: -32.00 USD MXPL 16.29
-   Win rate: 44% 27W 34L     [MINPL -46.71]
-   LS 6x1 5x1 4x2 | WS 7x1 4x1 3x2
-==========================================
-   Min bankroll: 110.71 USD 
-   Net P&L: -46.71 USD     [TGTPL ⏰]
-==========================================
-   ---------------- ADAPTIVE INVERSION ----------------
-   Parent signal: PUT | Executed: PUT | Inverted: NO
-   Virtual win rate: 52.5% (32W 29L) | Real win rate: 44.3% (27W 34L)
-   Inverted trades: 4W 9L | Executed as received: 23W 25L
-   Threshold: 68.5% (base 46.0%) | Gap: 3pp
-   Last adjustment: +20.5% (loss #8, normal: factor 20.5)
-   Next signal: INVERT (virtual 52.5% <= ON boundary 65.5%)
-   ----------------------------------------------------
-
-[Parent Active] Waiting for signal...
-[Parent Active] Signal PUT received -> INVERTED to CALL | stake 64.00 | trade open
-
-Entry 1721.10 -> Exit 1720.75 | Buy 64.00 | Signal CALL (parent PUT, INVERTED)
-===========================================❗❗❗❗❗❗❗ [CLS 7]
-   TRADE RESOLVED | ID: 21592554959    [URSVD 0]
-   Result: LOST  MXLS7 MXWS7
-   Current P&L: -64.00 USD MXPL 16.29
-   Win rate: 44% 27W 35L     [MINPL -110.71]
-   LS 7x1 5x1 4x2 | WS 7x1 4x1 3x2
-==========================================
-   Min bankroll: 238.71 USD 
-   Net P&L: -110.71 USD     [TGTPL ⏰]
+   Min bankroll: 224.77 USD 
+   Net P&L: -4.81 USD     [TGTPL ⏰]
 ==========================================
    ---------------- ADAPTIVE INVERSION ----------------
    Parent signal: PUT | Executed: CALL | Inverted: YES
-   Virtual win rate: 53.2% (33W 29L) | Real win rate: 43.5% (27W 35L)
-   Inverted trades: 4W 10L | Executed as received: 23W 25L
-   Threshold: 45.0% (base 46.0%) | Gap: 3pp
-   Last adjustment: -23.5% (loss #9, inverted: factor 23.5)
-   Next signal: KEEP (virtual 53.2% >= OFF boundary 48.0%)
+   Virtual win rate: 49.0% (74W 77L) | Real win rate: 43.0% (65W 86L)
+   Inverted trades: 33W 42L | Executed as received: 32W 44L
+   Threshold: 37.5% (base 46.0%) | Gap: 15pp
+   Last adjustment: -44.5% (loss #16, inverted: factor 44.5)
+   Next signal: INVERT (hysteresis band 22.5%-52.5%; keeping INVERT)
+   ----------------------------------------------------
+
+[Parent Active] Waiting for signal...
+[Parent Active] Signal CALL received -> INVERTED to PUT | stake 32.00 | trade open
+
+Entry 1711.49 -> Exit 1711.58 | Buy 32.00 | Signal PUT (parent CALL, INVERTED)
+===========================================❗❗❗❗❗❗ [CLS 6]
+   TRADE RESOLVED | ID: 21600001239    [URSVD 0]
+   Result: LOST  MXLS7 MXWS6
+   Current P&L: -32.00 USD MXPL 30.23
+   Win rate: 43% 65W 87L     [MINPL -96.77]
+   LS 7x1 6x2 4x3 | WS 6x1 4x1 3x2
+==========================================
+   Min bankroll: 224.77 USD 
+   Net P&L: -36.81 USD     [TGTPL ⏰]
+==========================================
+   ---------------- ADAPTIVE INVERSION ----------------
+   Parent signal: CALL | Executed: PUT | Inverted: YES
+   Virtual win rate: 49.3% (75W 77L) | Real win rate: 42.8% (65W 87L)
+   Inverted trades: 33W 43L | Executed as received: 32W 44L
+   Threshold: 20.0% (base 46.0%) | Gap: 15pp
+   Last adjustment: -17.5% (ledger delta -47.5%; threshold bounded) (loss #17, inverted: factor 47.5)
+   Next signal: KEEP (virtual 49.3% >= OFF boundary 35.0%)
+   ----------------------------------------------------
+
+[Parent Active] Waiting for signal...
+[Parent Active] Signal PUT received | stake 64.00 | trade open
+
+Entry 1711.54 -> Exit 1711.62 | Buy 64.00 | Signal PUT
+===========================================❗❗❗❗❗❗❗ [CLS 7]
+   TRADE RESOLVED | ID: 21600013759    [URSVD 0]
+   Result: LOST  MXLS7 MXWS6
+   Current P&L: -64.00 USD MXPL 30.23
+   Win rate: 42% 65W 88L     [MINPL -100.81]
+   LS 7x2 6x1 4x3 | WS 6x1 4x1 3x2
+==========================================
+   Min bankroll: 228.81 USD 
+   Net P&L: -100.81 USD     [TGTPL ⏰]
+==========================================
+   ---------------- ADAPTIVE INVERSION ----------------
+   Parent signal: PUT | Executed: PUT | Inverted: NO
+   Virtual win rate: 49.0% (75W 78L) | Real win rate: 42.5% (65W 88L)
+   Inverted trades: 33W 43L | Executed as received: 32W 45L
+   Threshold: 55.5% (base 46.0%) | Gap: 15pp
+   Last adjustment: +35.5% (loss #13, normal: factor 35.5)
+   Next signal: KEEP (hysteresis band 40.5%-70.5%; keeping KEEP)
+   ----------------------------------------------------
+
+[Parent Active] Waiting for signal...
+[Parent Active] Signal CALL received | stake 128.00 | trade open
+
+Entry 1710.27 -> Exit 1710.06 | Buy 128.00 | Signal CALL
+===========================================❗❗❗❗❗❗❗❗ [CLS 8]
+   TRADE RESOLVED | ID: 21600026959    [URSVD 0]
+   Result: LOST  MXLS8 MXWS6
+   Current P&L: -128.00 USD MXPL 30.23
+   Win rate: 42% 65W 89L     [MINPL -228.81]
+   LS 8x1 7x1 6x1 | WS 6x1 4x1 3x2
+==========================================
+   Min bankroll: 484.81 USD 
+   Net P&L: -228.81 USD     [TGTPL ⏰]
+==========================================
+   ---------------- ADAPTIVE INVERSION ----------------
+   Parent signal: CALL | Executed: CALL | Inverted: NO
+   Virtual win rate: 48.7% (75W 79L) | Real win rate: 42.2% (65W 89L)
+   Inverted trades: 33W 43L | Executed as received: 32W 46L
+   Threshold: 90.0% (base 46.0%) | Gap: 15pp
+   Last adjustment: +34.5% (ledger delta +38.5%; threshold bounded) (loss #14, normal: factor 38.5)
+   Next signal: INVERT (virtual 48.7% <= ON boundary 75.0%)
    ----------------------------------------------------
